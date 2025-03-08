@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Callable
 from urllib.parse import parse_qsl, urlencode
 import asyncio
 import hashlib
@@ -10,14 +9,17 @@ import os
 import re
 import sqlite_utils
 import textwrap
+from typing import List
 
+from datasette.events import AlterTableEvent, CreateTableEvent, InsertRowsEvent
 from datasette.database import QueryInterrupted
 from datasette.utils import (
     add_cors_headers,
     await_me_maybe,
     call_with_supported_arguments,
-    derive_named_parameters,
+    named_parameters as derive_named_parameters,
     format_bytes,
+    make_slot_function,
     tilde_decode,
     to_css_class,
     validate_sql_select,
@@ -56,13 +58,17 @@ class DatabaseView(View):
 
         sql = (request.args.get("sql") or "").strip()
         if sql:
+            redirect_url = "/" + request.url_vars.get("database") + "/-/query"
+            if request.url_vars.get("format"):
+                redirect_url += "." + request.url_vars.get("format")
+            redirect_url += "?" + request.query_string
+            return Response.redirect(redirect_url)
             return await QueryView()(request, datasette)
 
         if format_ not in ("html", "json"):
             raise NotFound("Invalid format: {}".format(format_))
 
-        metadata = (datasette.metadata("databases") or {}).get(database, {})
-        datasette.update_with_inherited_metadata(metadata)
+        metadata = await datasette.get_database_metadata(database)
 
         sql_views = []
         for view_name in await db.view_names():
@@ -126,9 +132,10 @@ class DatabaseView(View):
             "views": sql_views,
             "queries": canned_queries,
             "allow_execute_sql": allow_execute_sql,
-            "table_columns": await _table_columns(datasette, database)
-            if allow_execute_sql
-            else {},
+            "table_columns": (
+                await _table_columns(datasette, database) if allow_execute_sql else {}
+            ),
+            "metadata": await datasette.get_database_metadata(database),
         }
 
         if format_ == "json":
@@ -143,7 +150,8 @@ class DatabaseView(View):
             datasette.urls.path(path_with_format(request=request, format="json")),
         )
         templates = (f"database-{to_css_class(database)}.html", "database.html")
-        template = datasette.jinja_env.select_template(templates)
+        environment = datasette.get_jinja_environment(request)
+        template = environment.select_template(templates)
         context = {
             **json_data,
             "database_color": db.color,
@@ -151,6 +159,7 @@ class DatabaseView(View):
             "show_hidden": request.args.get("_show_hidden"),
             "editable": True,
             "metadata": metadata,
+            "count_limit": db.count_limit,
             "allow_download": datasette.setting("allow_download")
             and not db.is_mutable
             and not db.is_memory,
@@ -160,6 +169,9 @@ class DatabaseView(View):
                 f"{'*' if template_name == template.name else ''}{template_name}"
                 for template_name in templates
             ],
+            "top_database": make_slot_function(
+                "top_database", datasette, request, database=database
+            ),
         }
         return Response.html(
             await datasette.render_template(
@@ -245,12 +257,23 @@ class QueryContext:
             "help": "List of templates that were considered for rendering this page"
         }
     )
+    top_query: callable = field(
+        metadata={"help": "Callable to render the top_query slot"}
+    )
+    top_canned_query: callable = field(
+        metadata={"help": "Callable to render the top_canned_query slot"}
+    )
+    query_actions: callable = field(
+        metadata={
+            "help": "Callable returning a list of links for the query action menu"
+        }
+    )
 
 
 async def get_tables(datasette, request, db):
     tables = []
     database = db.name
-    table_counts = await db.table_counts(5)
+    table_counts = await db.table_counts(100)
     hidden_table_names = set(await db.hidden_table_names())
     all_foreign_keys = await db.get_all_foreign_keys()
 
@@ -368,7 +391,10 @@ class QueryView(View):
             or request.args.get("_json")
             or params.get("_json")
         )
-        params_for_query = MagicParameters(params, request, datasette)
+        params_for_query = MagicParameters(
+            canned_query["sql"], params, request, datasette
+        )
+        await params_for_query.execute_params()
         ok = None
         redirect_url = None
         try:
@@ -415,6 +441,8 @@ class QueryView(View):
 
     async def get(self, request, datasette):
         from datasette.app import TableNotFound
+
+        await datasette.refresh_schemas()
 
         db = await datasette.resolve_database(request)
         database = db.name
@@ -467,9 +495,7 @@ class QueryView(View):
         if canned_query and canned_query.get("params"):
             named_parameters = canned_query["params"]
         if not named_parameters:
-            named_parameters = await derive_named_parameters(
-                datasette.get_database(database), sql
-            )
+            named_parameters = derive_named_parameters(sql)
         named_parameter_values = {
             named_parameter: params.get(named_parameter) or ""
             for named_parameter in named_parameters
@@ -500,7 +526,8 @@ class QueryView(View):
                     validate_sql_select(sql)
                 else:
                     # Canned queries can run magic parameters
-                    params_for_query = MagicParameters(params, request, datasette)
+                    params_for_query = MagicParameters(sql, params, request, datasette)
+                    await params_for_query.execute_params()
                 results = await datasette.execute(
                     database, sql, params_for_query, truncate=True, **extra_args
                 )
@@ -594,7 +621,8 @@ class QueryView(View):
                     f"query-{to_css_class(database)}-{to_css_class(canned_query['name'])}.html",
                 )
 
-            template = datasette.jinja_env.select_template(templates)
+            environment = datasette.get_jinja_environment(request)
+            template = environment.select_template(templates)
             alternate_url_json = datasette.absolute_url(
                 request,
                 datasette.urls.path(path_with_format(request=request, format="json")),
@@ -607,8 +635,7 @@ class QueryView(View):
                     )
                 }
             )
-            metadata = (datasette.metadata("databases") or {}).get(database, {})
-            datasette.update_with_inherited_metadata(metadata)
+            metadata = await datasette.get_database_metadata(database)
 
             renderers = {}
             for key, (_, can_render) in datasette.renderers.items():
@@ -671,6 +698,7 @@ class QueryView(View):
             if allow_execute_sql and is_validated_sql and ":_" not in sql:
                 edit_sql_url = (
                     datasette.urls.database(database)
+                    + "/-/query"
                     + "?"
                     + urlencode(
                         {
@@ -681,6 +709,22 @@ class QueryView(View):
                         }
                     )
                 )
+
+            async def query_actions():
+                query_actions = []
+                for hook in pm.hook.query_actions(
+                    datasette=datasette,
+                    actor=request.actor,
+                    database=database,
+                    query_name=canned_query["name"] if canned_query else None,
+                    request=request,
+                    sql=sql,
+                    params=params,
+                ):
+                    extra_links = await await_me_maybe(hook)
+                    if extra_links:
+                        query_actions.extend(extra_links)
+                return query_actions
 
             r = Response.html(
                 await datasette.render_template(
@@ -708,9 +752,11 @@ class QueryView(View):
                         display_rows=await display_rows(
                             datasette, database, request, rows, columns
                         ),
-                        table_columns=await _table_columns(datasette, database)
-                        if allow_execute_sql
-                        else {},
+                        table_columns=(
+                            await _table_columns(datasette, database)
+                            if allow_execute_sql
+                            else {}
+                        ),
                         columns=columns,
                         renderers=renderers,
                         url_csv=datasette.urls.path(
@@ -725,6 +771,17 @@ class QueryView(View):
                             f"{'*' if template_name == template.name else ''}{template_name}"
                             for template_name in templates
                         ],
+                        top_query=make_slot_function(
+                            "top_query", datasette, request, database=database, sql=sql
+                        ),
+                        top_canned_query=make_slot_function(
+                            "top_canned_query",
+                            datasette,
+                            request,
+                            database=database,
+                            query_name=canned_query["name"] if canned_query else None,
+                        ),
+                        query_actions=query_actions,
                     ),
                     request=request,
                     view_name="database",
@@ -739,14 +796,26 @@ class QueryView(View):
 
 
 class MagicParameters(dict):
-    def __init__(self, data, request, datasette):
+    def __init__(self, sql, data, request, datasette):
         super().__init__(data)
+        self._sql = sql
         self._request = request
         self._magics = dict(
             itertools.chain.from_iterable(
                 pm.hook.register_magic_parameters(datasette=datasette)
             )
         )
+        self._prepared = {}
+
+    async def execute_params(self):
+        for key in derive_named_parameters(self._sql):
+            if key.startswith("_") and key.count("_") >= 2:
+                prefix, suffix = key[1:].split("_", 1)
+                if prefix in self._magics:
+                    result = await await_me_maybe(
+                        self._magics[prefix](suffix, self._request)
+                    )
+                    self._prepared[key] = result
 
     def __len__(self):
         # Workaround for 'Incorrect number of bindings' error
@@ -755,6 +824,9 @@ class MagicParameters(dict):
 
     def __getitem__(self, key):
         if key.startswith("_") and key.count("_") >= 2:
+            if key in self._prepared:
+                return self._prepared[key]
+            # Try the other route
             prefix, suffix = key[1:].split("_", 1)
             if prefix in self._magics:
                 try:
@@ -768,7 +840,17 @@ class MagicParameters(dict):
 class TableCreateView(BaseView):
     name = "table-create"
 
-    _valid_keys = {"table", "rows", "row", "columns", "pk", "pks", "ignore", "replace"}
+    _valid_keys = {
+        "table",
+        "rows",
+        "row",
+        "columns",
+        "pk",
+        "pks",
+        "ignore",
+        "replace",
+        "alter",
+    }
     _supported_column_types = {
         "text",
         "integer",
@@ -826,7 +908,7 @@ class TableCreateView(BaseView):
             if not await self.ds.permission_allowed(
                 request.actor, "update-row", resource=database_name
             ):
-                return _error(["Permission denied - need update-row"], 403)
+                return _error(["Permission denied: need update-row"], 403)
 
         table_name = data.get("table")
         if not table_name:
@@ -850,7 +932,21 @@ class TableCreateView(BaseView):
             if not await self.ds.permission_allowed(
                 request.actor, "insert-row", resource=database_name
             ):
-                return _error(["Permission denied - need insert-row"], 403)
+                return _error(["Permission denied: need insert-row"], 403)
+
+        alter = False
+        if rows or row:
+            if not table_exists:
+                # if table is being created for the first time, alter=True
+                alter = True
+            else:
+                # alter=True only if they request it AND they have permission
+                if data.get("alter"):
+                    if not await self.ds.permission_allowed(
+                        request.actor, "alter-table", resource=database_name
+                    ):
+                        return _error(["Permission denied: need alter-table"], 403)
+                    alter = True
 
         if columns:
             if rows or row:
@@ -915,10 +1011,18 @@ class TableCreateView(BaseView):
                 return _error(["pk cannot be changed for existing table"])
             pks = actual_pks
 
+        initial_schema = None
+        if table_exists:
+            initial_schema = await db.execute_fn(
+                lambda conn: sqlite_utils.Database(conn)[table_name].schema
+            )
+
         def create_table(conn):
             table = sqlite_utils.Database(conn)[table_name]
             if rows:
-                table.insert_all(rows, pk=pks or pk, ignore=ignore, replace=replace)
+                table.insert_all(
+                    rows, pk=pks or pk, ignore=ignore, replace=replace, alter=alter
+                )
             else:
                 table.create(
                     {c["name"]: c["type"] for c in columns},
@@ -930,6 +1034,18 @@ class TableCreateView(BaseView):
             schema = await db.execute_write_fn(create_table)
         except Exception as e:
             return _error([str(e)])
+
+        if initial_schema is not None and initial_schema != schema:
+            await self.ds.track_event(
+                AlterTableEvent(
+                    request.actor,
+                    database=database_name,
+                    table=table_name,
+                    before_schema=initial_schema,
+                    after_schema=schema,
+                )
+            )
+
         table_url = self.ds.absolute_url(
             request, self.ds.urls.table(db.name, table_name)
         )
@@ -946,6 +1062,25 @@ class TableCreateView(BaseView):
         }
         if rows:
             details["row_count"] = len(rows)
+
+        if not table_exists:
+            # Only log creation if we created a table
+            await self.ds.track_event(
+                CreateTableEvent(
+                    request.actor, database=db.name, table=table_name, schema=schema
+                )
+            )
+        if rows:
+            await self.ds.track_event(
+                InsertRowsEvent(
+                    request.actor,
+                    database=db.name,
+                    table=table_name,
+                    num_rows=len(rows),
+                    ignore=ignore,
+                    replace=replace,
+                )
+            )
         return Response.json(details, status=201)
 
 
@@ -1015,9 +1150,11 @@ async def display_rows(datasette, database, request, rows, columns):
                     display_value = markupsafe.Markup(
                         '<a class="blob-download" href="{}"{}>&lt;Binary:&nbsp;{:,}&nbsp;byte{}&gt;</a>'.format(
                             blob_url,
-                            ' title="{}"'.format(formatted)
-                            if "bytes" not in formatted
-                            else "",
+                            (
+                                ' title="{}"'.format(formatted)
+                                if "bytes" not in formatted
+                                else ""
+                            ),
                             len(value),
                             "" if len(value) == 1 else "s",
                         )

@@ -17,7 +17,7 @@ async def init_internal_db(db):
         rootpage INTEGER,
         sql TEXT,
         PRIMARY KEY (database_name, table_name),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name)
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name)
     );
     CREATE TABLE IF NOT EXISTS catalog_columns (
         database_name TEXT,
@@ -30,8 +30,8 @@ async def init_internal_db(db):
         is_pk INTEGER, -- renamed from pk
         hidden INTEGER,
         PRIMARY KEY (database_name, table_name, name),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name),
-        FOREIGN KEY (database_name, table_name) REFERENCES tables(database_name, table_name)
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name),
+        FOREIGN KEY (database_name, table_name) REFERENCES catalog_tables(database_name, table_name)
     );
     CREATE TABLE IF NOT EXISTS catalog_indexes (
         database_name TEXT,
@@ -42,8 +42,8 @@ async def init_internal_db(db):
         origin TEXT,
         partial INTEGER,
         PRIMARY KEY (database_name, table_name, name),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name),
-        FOREIGN KEY (database_name, table_name) REFERENCES tables(database_name, table_name)
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name),
+        FOREIGN KEY (database_name, table_name) REFERENCES catalog_tables(database_name, table_name)
     );
     CREATE TABLE IF NOT EXISTS catalog_foreign_keys (
         database_name TEXT,
@@ -57,12 +57,51 @@ async def init_internal_db(db):
         on_delete TEXT,
         match TEXT,
         PRIMARY KEY (database_name, table_name, id, seq),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name),
-        FOREIGN KEY (database_name, table_name) REFERENCES tables(database_name, table_name)
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name),
+        FOREIGN KEY (database_name, table_name) REFERENCES catalog_tables(database_name, table_name)
     );
     """
     ).strip()
     await db.execute_write_script(create_tables_sql)
+    await initialize_metadata_tables(db)
+
+
+async def initialize_metadata_tables(db):
+    await db.execute_write_script(
+        textwrap.dedent(
+            """
+        CREATE TABLE IF NOT EXISTS metadata_instance (
+            key text,
+            value text,
+            unique(key)
+        );
+
+        CREATE TABLE IF NOT EXISTS metadata_databases (
+            database_name text,
+            key text,
+            value text,
+            unique(database_name, key)
+        );
+
+        CREATE TABLE IF NOT EXISTS metadata_resources (
+            database_name text,
+            resource_name text,
+            key text,
+            value text,
+            unique(database_name, resource_name, key)
+        );
+
+        CREATE TABLE IF NOT EXISTS metadata_columns (
+            database_name text,
+            resource_name text,
+            column_name text,
+            key text,
+            value text,
+            unique(database_name, resource_name, column_name, key)
+        );
+            """
+        )
+    )
 
 
 async def populate_schema_tables(internal_db, db):
@@ -76,7 +115,8 @@ async def populate_schema_tables(internal_db, db):
             "DELETE FROM catalog_columns WHERE database_name = ?", [database_name]
         )
         conn.execute(
-            "DELETE FROM catalog_foreign_keys WHERE database_name = ?", [database_name]
+            "DELETE FROM catalog_foreign_keys WHERE database_name = ?",
+            [database_name],
         )
         conn.execute(
             "DELETE FROM catalog_indexes WHERE database_name = ?", [database_name]

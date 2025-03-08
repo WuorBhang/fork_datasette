@@ -1,7 +1,12 @@
-import hashlib
 import json
 
-from datasette.utils import add_cors_headers, CustomJSONEncoder
+from datasette.plugins import pm
+from datasette.utils import (
+    add_cors_headers,
+    await_me_maybe,
+    make_slot_function,
+    CustomJSONEncoder,
+)
 from datasette.utils.asgi import Response
 from datasette.version import __version__
 
@@ -127,20 +132,41 @@ class IndexView(BaseView):
             if self.ds.cors:
                 add_cors_headers(headers)
             return Response(
-                json.dumps({db["name"]: db for db in databases}, cls=CustomJSONEncoder),
+                json.dumps(
+                    {
+                        "databases": {db["name"]: db for db in databases},
+                        "metadata": await self.ds.get_instance_metadata(),
+                    },
+                    cls=CustomJSONEncoder,
+                ),
                 content_type="application/json; charset=utf-8",
                 headers=headers,
             )
         else:
+            homepage_actions = []
+            for hook in pm.hook.homepage_actions(
+                datasette=self.ds,
+                actor=request.actor,
+                request=request,
+            ):
+                extra_links = await await_me_maybe(hook)
+                if extra_links:
+                    homepage_actions.extend(extra_links)
+            alternative_homepage = request.path == "/-/"
             return await self.render(
-                ["index.html"],
+                ["default:index.html" if alternative_homepage else "index.html"],
                 request=request,
                 context={
                     "databases": databases,
-                    "metadata": self.ds.metadata(),
+                    "metadata": await self.ds.get_instance_metadata(),
                     "datasette_version": __version__,
                     "private": not await self.ds.permission_allowed(
                         None, "view-instance"
                     ),
+                    "top_homepage": make_slot_function(
+                        "top_homepage", self.ds, request
+                    ),
+                    "homepage_actions": homepage_actions,
+                    "noindex": request.path == "/-/",
                 },
             )

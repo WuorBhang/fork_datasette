@@ -4,7 +4,6 @@ from .fixtures import (
     TestClient as _TestClient,
     EXPECTED_PLUGINS,
 )
-import asyncio
 from datasette.app import SETTINGS
 from datasette.plugins import DEFAULT_PLUGINS
 from datasette.cli import cli, serve
@@ -19,7 +18,6 @@ import pytest
 import sys
 import textwrap
 from unittest import mock
-import urllib
 
 
 def test_inspect_cli(app_client):
@@ -38,7 +36,7 @@ def test_inspect_cli(app_client):
         assert expected_count == database["tables"][table_name]["count"]
 
 
-def test_inspect_cli_writes_to_file(app_client):
+def test_inspect_cli_writes_to_file(event_loop, app_client):
     runner = CliRunner()
     result = runner.invoke(
         cli, ["inspect", "fixtures.db", "--inspect-file", "foo.json"]
@@ -100,7 +98,11 @@ def test_spatialite_error_if_cannot_find_load_extension_spatialite():
 def test_plugins_cli(app_client):
     runner = CliRunner()
     result1 = runner.invoke(cli, ["plugins"])
-    assert json.loads(result1.output) == EXPECTED_PLUGINS
+    actual_plugins = sorted(
+        [p for p in json.loads(result1.output) if p["name"] != "TrackEventPlugin"],
+        key=lambda p: p["name"],
+    )
+    assert actual_plugins == EXPECTED_PLUGINS
     # Try with --all
     result2 = runner.invoke(cli, ["plugins", "--all"])
     names = [p["name"] for p in json.loads(result2.output)]
@@ -157,8 +159,8 @@ def test_metadata_yaml():
         internal=None,
     )
     client = _TestClient(ds)
-    response = client.get("/-/metadata.json")
-    assert {"title": "Hello from YAML"} == response.json
+    response = client.get("/.json")
+    assert {"title": "Hello from YAML"} == response.json["metadata"]
 
 
 @mock.patch("datasette.cli.run_module")
@@ -238,6 +240,31 @@ def test_setting(args):
     assert settings["default_page_size"] == 5
 
 
+def test_setting_compatible_with_config(tmp_path):
+    # https://github.com/simonw/datasette/issues/2389
+    runner = CliRunner()
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"settings": {"default_page_size": 5, "sql_time_limit_ms": 50}}', "utf-8"
+    )
+    result = runner.invoke(
+        cli,
+        [
+            "--get",
+            "/-/settings.json",
+            "--config",
+            str(config_path),
+            "--setting",
+            "default_page_size",
+            "10",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    settings = json.loads(result.output)
+    assert settings["default_page_size"] == 10
+    assert settings["sql_time_limit_ms"] == 50
+
+
 def test_plugin_s_overwrite():
     runner = CliRunner()
     plugins_dir = str(pathlib.Path(__file__).parent / "plugins")
@@ -248,7 +275,7 @@ def test_plugin_s_overwrite():
             "--plugins-dir",
             plugins_dir,
             "--get",
-            "/_memory.json?sql=select+prepare_connection_args()",
+            "/_memory/-/query.json?sql=select+prepare_connection_args()",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -263,7 +290,7 @@ def test_plugin_s_overwrite():
             "--plugins-dir",
             plugins_dir,
             "--get",
-            "/_memory.json?sql=select+prepare_connection_args()",
+            "/_memory/-/query.json?sql=select+prepare_connection_args()",
             "-s",
             "plugins.name-of-plugin",
             "OVERRIDE",
@@ -293,7 +320,7 @@ def test_setting_default_allow_sql(default_allow_sql):
             "default_allow_sql",
             "on" if default_allow_sql else "off",
             "--get",
-            "/_memory.json?sql=select+21&_shape=objects",
+            "/_memory/-/query.json?sql=select+21&_shape=objects",
         ],
     )
     if default_allow_sql:
@@ -307,7 +334,7 @@ def test_setting_default_allow_sql(default_allow_sql):
 
 def test_sql_errors_logged_to_stderr():
     runner = CliRunner(mix_stderr=False)
-    result = runner.invoke(cli, ["--get", "/_memory.json?sql=select+blah"])
+    result = runner.invoke(cli, ["--get", "/_memory/-/query.json?sql=select+blah"])
     assert result.exit_code == 1
     assert "sql = 'select blah', params = {}: no such column: blah\n" in result.stderr
 
@@ -335,9 +362,11 @@ def test_serve_create(tmpdir):
 def test_serve_config(tmpdir, argument, format_):
     config_path = tmpdir / "datasette.{}".format(format_)
     config_path.write_text(
-        "settings:\n  default_page_size: 5\n"
-        if format_ == "yaml"
-        else '{"settings": {"default_page_size": 5}}',
+        (
+            "settings:\n  default_page_size: 5\n"
+            if format_ == "yaml"
+            else '{"settings": {"default_page_size": 5}}'
+        ),
         "utf-8",
     )
     runner = CliRunner()

@@ -1,3 +1,4 @@
+from datasette.app import Datasette
 from bs4 import BeautifulSoup as Soup
 import pytest
 from .fixtures import (  # noqa
@@ -96,6 +97,52 @@ async def test_table_csv_with_nullable_labels(ds_client):
 
 
 @pytest.mark.asyncio
+async def test_table_csv_with_invalid_labels():
+    # https://github.com/simonw/datasette/issues/2214
+    ds = Datasette(
+        config={
+            "databases": {
+                "db_2214": {
+                    "tables": {
+                        "t2": {
+                            "label_column": "name",
+                        }
+                    }
+                }
+            }
+        }
+    )
+    await ds.invoke_startup()
+    db = ds.add_memory_database("db_2214")
+    await db.execute_write_script(
+        """
+        create table t1 (id integer primary key, name text);
+        insert into t1 (id, name) values (1, 'one');
+        insert into t1 (id, name) values (2, 'two');
+        create table t2 (textid text primary key, name text);
+        insert into t2 (textid, name) values ('a', 'alpha');
+        insert into t2 (textid, name) values ('b', 'beta');
+        create table if not exists maintable (
+            id integer primary key,
+            fk_integer integer references t1(id),
+            fk_text text references t2(textid)
+        );
+        insert into maintable (id, fk_integer, fk_text) values (1, 1, 'a');
+        insert into maintable (id, fk_integer, fk_text) values (2, 3, 'b'); -- invalid fk_integer
+        insert into maintable (id, fk_integer, fk_text) values (3, 2, 'c'); -- invalid fk_text
+    """
+    )
+    response = await ds.client.get("/db_2214/maintable.csv?_labels=1")
+    assert response.status_code == 200
+    assert response.text == (
+        "id,fk_integer,fk_integer_label,fk_text,fk_text_label\r\n"
+        "1,1,one,a,alpha\r\n"
+        "2,3,,b,beta\r\n"
+        "3,2,two,c,\r\n"
+    )
+
+
+@pytest.mark.asyncio
 async def test_table_csv_blob_columns(ds_client):
     response = await ds_client.get("/fixtures/binary_data.csv")
     assert response.status_code == 200
@@ -111,14 +158,14 @@ async def test_table_csv_blob_columns(ds_client):
 @pytest.mark.asyncio
 async def test_custom_sql_csv_blob_columns(ds_client):
     response = await ds_client.get(
-        "/fixtures.csv?sql=select+rowid,+data+from+binary_data"
+        "/fixtures/-/query.csv?sql=select+rowid,+data+from+binary_data"
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/plain; charset=utf-8"
     assert response.text == (
         "rowid,data\r\n"
-        '1,"http://localhost/fixtures.blob?sql=select+rowid,+data+from+binary_data&_blob_column=data&_blob_hash=f3088978da8f9aea479ffc7f631370b968d2e855eeb172bea7f6c7a04262bb6d"\r\n'
-        '2,"http://localhost/fixtures.blob?sql=select+rowid,+data+from+binary_data&_blob_column=data&_blob_hash=b835b0483cedb86130b9a2c280880bf5fadc5318ddf8c18d0df5204d40df1724"\r\n'
+        '1,"http://localhost/fixtures/-/query.blob?sql=select+rowid,+data+from+binary_data&_blob_column=data&_blob_hash=f3088978da8f9aea479ffc7f631370b968d2e855eeb172bea7f6c7a04262bb6d"\r\n'
+        '2,"http://localhost/fixtures/-/query.blob?sql=select+rowid,+data+from+binary_data&_blob_column=data&_blob_hash=b835b0483cedb86130b9a2c280880bf5fadc5318ddf8c18d0df5204d40df1724"\r\n'
         "3,\r\n"
     )
 
@@ -126,7 +173,7 @@ async def test_custom_sql_csv_blob_columns(ds_client):
 @pytest.mark.asyncio
 async def test_custom_sql_csv(ds_client):
     response = await ds_client.get(
-        "/fixtures.csv?sql=select+content+from+simple_primary_key+limit+2"
+        "/fixtures/-/query.csv?sql=select+content+from+simple_primary_key+limit+2"
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/plain; charset=utf-8"
@@ -147,13 +194,14 @@ async def test_table_csv_download(ds_client):
 @pytest.mark.asyncio
 async def test_csv_with_non_ascii_characters(ds_client):
     response = await ds_client.get(
-        "/fixtures.csv?sql=select%0D%0A++%27%F0%9D%90%9C%F0%9D%90%A2%F0%9D%90%AD%F0%9D%90%A2%F0%9D%90%9E%F0%9D%90%AC%27+as+text%2C%0D%0A++1+as+number%0D%0Aunion%0D%0Aselect%0D%0A++%27bob%27+as+text%2C%0D%0A++2+as+number%0D%0Aorder+by%0D%0A++number"
+        "/fixtures/-/query.csv?sql=select%0D%0A++%27%F0%9D%90%9C%F0%9D%90%A2%F0%9D%90%AD%F0%9D%90%A2%F0%9D%90%9E%F0%9D%90%AC%27+as+text%2C%0D%0A++1+as+number%0D%0Aunion%0D%0Aselect%0D%0A++%27bob%27+as+text%2C%0D%0A++2+as+number%0D%0Aorder+by%0D%0A++number"
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/plain; charset=utf-8"
     assert response.text == "text,number\r\n𝐜𝐢𝐭𝐢𝐞𝐬,1\r\nbob,2\r\n"
 
 
+@pytest.mark.xfail(reason="Flaky, see https://github.com/simonw/datasette/issues/2355")
 def test_max_csv_mb(app_client_csv_max_mb_one):
     # This query deliberately generates a really long string
     # should be 100*100*100*2 = roughly 2MB

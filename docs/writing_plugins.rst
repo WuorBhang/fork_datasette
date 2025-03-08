@@ -7,6 +7,30 @@ You can write one-off plugins that apply to just one Datasette instance, or you 
 
 Want to start by looking at an example? The `Datasette plugins directory <https://datasette.io/plugins>`__ lists more than 90 open source plugins with code you can explore. The :ref:`plugin hooks <plugin_hooks>` page includes links to example plugins for each of the documented hooks.
 
+.. _writing_plugins_tracing:
+
+Tracing plugin hooks
+--------------------
+
+The ``DATASETTE_TRACE_PLUGINS`` environment variable turns on detailed tracing showing exactly which hooks are being run. This can be useful for understanding how Datasette is using your plugin.
+
+.. code-block:: bash
+
+    DATASETTE_TRACE_PLUGINS=1 datasette mydb.db
+
+Example output::
+
+    actor_from_request:
+    {   'datasette': <datasette.app.Datasette object at 0x100bc7220>,
+        'request': <asgi.Request method="GET" url="http://127.0.0.1:4433/">}
+    Hook implementations:
+    [   <HookImpl plugin_name='codespaces', plugin=<module 'datasette_codespaces' from '.../site-packages/datasette_codespaces/__init__.py'>>,
+        <HookImpl plugin_name='datasette.actor_auth_cookie', plugin=<module 'datasette.actor_auth_cookie' from '.../datasette/datasette/actor_auth_cookie.py'>>,
+        <HookImpl plugin_name='datasette.default_permissions', plugin=<module 'datasette.default_permissions' from '.../datasette/default_permissions.py'>>]
+    Results:
+    [{'id': 'root'}]
+
+
 .. _writing_plugins_one_off:
 
 Writing one-off plugins
@@ -100,7 +124,6 @@ And a Python module file, ``datasette_plugin_demos.py``, that implements the plu
             "random_integer", 2, random.randint
         )
 
-
 Having built a plugin in this way you can turn it into an installable package using the following command::
 
     python3 setup.py sdist
@@ -139,6 +162,8 @@ To bundle the static assets for a plugin in the package that you publish to PyPI
 Where ``datasette_plugin_name`` is the name of the plugin package (note that it uses underscores, not hyphens) and ``static/plugin.js`` is the path within that package to the static file.
 
 `datasette-cluster-map <https://github.com/simonw/datasette-cluster-map>`__ is a useful example of a plugin that includes packaged static assets in this way.
+
+See :ref:`customization_css` for tips on writing CSS that is compatible with Datasette's default CSS, including details of the ``core`` class for applying Datasette's default form element styles.
 
 .. _writing_plugins_custom_templates:
 

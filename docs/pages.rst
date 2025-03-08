@@ -23,6 +23,8 @@ Add ``/.json`` to the end of the URL for the JSON version of the underlying data
 * `global-power-plants.datasettes.com/.json <https://global-power-plants.datasettes.com/.json>`_
 * `register-of-members-interests.datasettes.com/.json <https://register-of-members-interests.datasettes.com/.json>`_
 
+The index page can also be accessed at ``/-/``, useful for if the default index page has been replaced using an :ref:`index.html custom template <customization_custom_templates>`. The ``/-/`` page will always render the default Datasette ``index.html`` template.
+
 .. _DatabaseView:
 
 Database
@@ -39,6 +41,36 @@ The JSON version of this page provides programmatic access to the underlying dat
 
 * `fivethirtyeight.datasettes.com/fivethirtyeight.json <https://fivethirtyeight.datasettes.com/fivethirtyeight.json>`_
 * `global-power-plants.datasettes.com/global-power-plants.json <https://global-power-plants.datasettes.com/global-power-plants.json>`_
+
+.. _DatabaseView_hidden:
+
+Hidden tables
+-------------
+
+Some tables listed on the database page are treated as hidden. Hidden tables are not completely invisible - they can be accessed through the "hidden tables" link at the bottom of the page. They are hidden because they represent low-level implementation details which are generally not useful to end-users of Datasette.
+
+The following tables are hidden by default:
+
+- Any table with a name that starts with an underscore - this is a Datasette convention to help plugins easily hide their own internal tables.
+- Tables that have been configured as ``"hidden": true`` using :ref:`metadata_hiding_tables`.
+- ``*_fts`` tables that implement SQLite full-text search indexes.
+- Tables relating to the inner workings of the SpatiaLite SQLite extension.
+- ``sqlite_stat`` tables used to store statistics used by the query optimizer.
+
+.. _QueryView:
+
+Queries
+=======
+
+The ``/database-name/-/query`` page can be used to execute an arbitrary SQL query against that database, if the :ref:`permissions_execute_sql` permission is enabled. This query is passed as the ``?sql=`` query string parameter.
+
+This means you can link directly to a query by constructing the following URL:
+
+``/database-name/-/query?sql=SELECT+*+FROM+table_name``
+
+Each configured :ref:`canned query <canned_queries>` has its own page, at ``/database-name/query-name``. Viewing this page will execute the query and display the results.
+
+In both cases adding a ``.json`` extension to the URL will return the results as JSON.
 
 .. _TableView:
 
@@ -70,10 +102,10 @@ Table cells with extremely long text contents are truncated on the table view ac
 
 Rows which are the targets of foreign key references from other tables will show a link to a filtered search for all records that reference that row. Here's an example from the Registers of Members Interests database:
 
-`../people/uk.org.publicwhip%2Fperson%2F10001 <https://register-of-members-interests.datasettes.com/regmem/people/uk.org.publicwhip%2Fperson%2F10001>`_
+`../people/uk~2Eorg~2Epublicwhip~2Fperson~2F10001 <https://register-of-members-interests.datasettes.com/regmem/people/uk~2Eorg~2Epublicwhip~2Fperson~2F10001>`_
 
 Note that this URL includes the encoded primary key of the record.
 
 Here's that same page as JSON:
 
-`../people/uk.org.publicwhip%2Fperson%2F10001.json <https://register-of-members-interests.datasettes.com/regmem/people/uk.org.publicwhip%2Fperson%2F10001.json>`_
+`../people/uk~2Eorg~2Epublicwhip~2Fperson~2F10001.json <https://register-of-members-interests.datasettes.com/regmem/people/uk~2Eorg~2Epublicwhip~2Fperson~2F10001.json>`_

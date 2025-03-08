@@ -24,11 +24,11 @@ async def test_table_json(ds_client):
     )
     assert data["query"]["params"] == {}
     assert data["rows"] == [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-        {"id": "5", "content": "RENDER_CELL_ASYNC"},
+        {"id": 1, "content": "hello"},
+        {"id": 2, "content": "world"},
+        {"id": 3, "content": ""},
+        {"id": 4, "content": "RENDER_CELL_DEMO"},
+        {"id": 5, "content": "RENDER_CELL_ASYNC"},
     ]
 
 
@@ -36,7 +36,7 @@ async def test_table_json(ds_client):
 async def test_table_not_exists_json(ds_client):
     assert (await ds_client.get("/fixtures/blah.json")).json() == {
         "ok": False,
-        "error": "Table not found: blah",
+        "error": "Table not found",
         "status": 404,
         "title": None,
     }
@@ -46,18 +46,18 @@ async def test_table_not_exists_json(ds_client):
 async def test_table_shape_arrays(ds_client):
     response = await ds_client.get("/fixtures/simple_primary_key.json?_shape=arrays")
     assert response.json()["rows"] == [
-        ["1", "hello"],
-        ["2", "world"],
-        ["3", ""],
-        ["4", "RENDER_CELL_DEMO"],
-        ["5", "RENDER_CELL_ASYNC"],
+        [1, "hello"],
+        [2, "world"],
+        [3, ""],
+        [4, "RENDER_CELL_DEMO"],
+        [5, "RENDER_CELL_ASYNC"],
     ]
 
 
 @pytest.mark.asyncio
 async def test_table_shape_arrayfirst(ds_client):
     response = await ds_client.get(
-        "/fixtures.json?"
+        "/fixtures/-/query.json?"
         + urllib.parse.urlencode(
             {
                 "sql": "select content from simple_primary_key order by id",
@@ -78,11 +78,11 @@ async def test_table_shape_arrayfirst(ds_client):
 async def test_table_shape_objects(ds_client):
     response = await ds_client.get("/fixtures/simple_primary_key.json?_shape=objects")
     assert response.json()["rows"] == [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-        {"id": "5", "content": "RENDER_CELL_ASYNC"},
+        {"id": 1, "content": "hello"},
+        {"id": 2, "content": "world"},
+        {"id": 3, "content": ""},
+        {"id": 4, "content": "RENDER_CELL_DEMO"},
+        {"id": 5, "content": "RENDER_CELL_ASYNC"},
     ]
 
 
@@ -90,11 +90,11 @@ async def test_table_shape_objects(ds_client):
 async def test_table_shape_array(ds_client):
     response = await ds_client.get("/fixtures/simple_primary_key.json?_shape=array")
     assert response.json() == [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-        {"id": "5", "content": "RENDER_CELL_ASYNC"},
+        {"id": 1, "content": "hello"},
+        {"id": 2, "content": "world"},
+        {"id": 3, "content": ""},
+        {"id": 4, "content": "RENDER_CELL_DEMO"},
+        {"id": 5, "content": "RENDER_CELL_ASYNC"},
     ]
 
 
@@ -106,11 +106,11 @@ async def test_table_shape_array_nl(ds_client):
     lines = response.text.split("\n")
     results = [json.loads(line) for line in lines]
     assert [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-        {"id": "5", "content": "RENDER_CELL_ASYNC"},
+        {"id": 1, "content": "hello"},
+        {"id": 2, "content": "world"},
+        {"id": 3, "content": ""},
+        {"id": 4, "content": "RENDER_CELL_DEMO"},
+        {"id": 5, "content": "RENDER_CELL_ASYNC"},
     ] == results
 
 
@@ -129,11 +129,11 @@ async def test_table_shape_invalid(ds_client):
 async def test_table_shape_object(ds_client):
     response = await ds_client.get("/fixtures/simple_primary_key.json?_shape=object")
     assert response.json() == {
-        "1": {"id": "1", "content": "hello"},
-        "2": {"id": "2", "content": "world"},
-        "3": {"id": "3", "content": ""},
-        "4": {"id": "4", "content": "RENDER_CELL_DEMO"},
-        "5": {"id": "5", "content": "RENDER_CELL_ASYNC"},
+        "1": {"id": 1, "content": "hello"},
+        "2": {"id": 2, "content": "world"},
+        "3": {"id": 3, "content": ""},
+        "4": {"id": 4, "content": "RENDER_CELL_DEMO"},
+        "5": {"id": 5, "content": "RENDER_CELL_ASYNC"},
     }
 
 
@@ -305,9 +305,11 @@ async def test_paginate_compound_keys_with_extra_filters(ds_client):
             "_sort_desc=sortable_with_nulls",
             lambda row: (
                 1 if row["sortable_with_nulls"] is None else 0,
-                -row["sortable_with_nulls"]
-                if row["sortable_with_nulls"] is not None
-                else 0,
+                (
+                    -row["sortable_with_nulls"]
+                    if row["sortable_with_nulls"] is not None
+                    else 0
+                ),
                 row["content"],
             ),
             "sorted by sortable_with_nulls descending",
@@ -520,27 +522,27 @@ async def test_searchable_invalid_column(ds_client):
     [
         (
             "/fixtures/simple_primary_key.json?_shape=arrays&content=hello",
-            [["1", "hello"]],
+            [[1, "hello"]],
         ),
         (
             "/fixtures/simple_primary_key.json?_shape=arrays&content__contains=o",
             [
-                ["1", "hello"],
-                ["2", "world"],
-                ["4", "RENDER_CELL_DEMO"],
+                [1, "hello"],
+                [2, "world"],
+                [4, "RENDER_CELL_DEMO"],
             ],
         ),
         (
             "/fixtures/simple_primary_key.json?_shape=arrays&content__exact=",
-            [["3", ""]],
+            [[3, ""]],
         ),
         (
             "/fixtures/simple_primary_key.json?_shape=arrays&content__not=world",
             [
-                ["1", "hello"],
-                ["3", ""],
-                ["4", "RENDER_CELL_DEMO"],
-                ["5", "RENDER_CELL_ASYNC"],
+                [1, "hello"],
+                [3, ""],
+                [4, "RENDER_CELL_DEMO"],
+                [5, "RENDER_CELL_ASYNC"],
             ],
         ),
     ],
@@ -556,9 +558,9 @@ async def test_table_filter_queries_multiple_of_same_type(ds_client):
         "/fixtures/simple_primary_key.json?_shape=arrays&content__not=world&content__not=hello"
     )
     assert [
-        ["3", ""],
-        ["4", "RENDER_CELL_DEMO"],
-        ["5", "RENDER_CELL_ASYNC"],
+        [3, ""],
+        [4, "RENDER_CELL_DEMO"],
+        [5, "RENDER_CELL_ASYNC"],
     ] == response.json()["rows"]
 
 
@@ -697,7 +699,7 @@ async def test_table_through(ds_client):
 @pytest.mark.asyncio
 async def test_max_returned_rows(ds_client):
     response = await ds_client.get(
-        "/fixtures.json?sql=select+content+from+no_primary_key"
+        "/fixtures/-/query.json?sql=select+content+from+no_primary_key"
     )
     data = response.json()
     assert data["truncated"]
@@ -716,22 +718,6 @@ async def test_view(ds_client):
         {"upper_content": "RENDER_CELL_DEMO", "content": "RENDER_CELL_DEMO"},
         {"upper_content": "RENDER_CELL_ASYNC", "content": "RENDER_CELL_ASYNC"},
     ]
-
-
-@pytest.mark.xfail
-@pytest.mark.asyncio
-async def test_unit_filters(ds_client):
-    response = await ds_client.get(
-        "/fixtures/units.json?_shape=arrays&distance__lt=75km&frequency__gt=1kHz"
-    )
-    assert response.status_code == 200
-    data = response.json()
-
-    assert data["units"]["distance"] == "m"
-    assert data["units"]["frequency"] == "Hz"
-
-    assert len(data["rows"]) == 1
-    assert data["rows"][0][0] == 2
 
 
 def test_page_size_matching_max_returned_rows(
@@ -1114,8 +1100,8 @@ async def test_expand_label(ds_client):
     assert response.json() == {
         "1": {
             "pk": "1",
-            "foreign_key_with_label": {"value": "1", "label": "hello"},
-            "foreign_key_with_blank_label": "3",
+            "foreign_key_with_label": {"value": 1, "label": "hello"},
+            "foreign_key_with_blank_label": 3,
             "foreign_key_with_no_label": "1",
             "foreign_key_compound_pk1": "a",
             "foreign_key_compound_pk2": "b",
@@ -1177,8 +1163,8 @@ async def test_null_and_compound_foreign_keys_are_not_expanded(ds_client):
     assert response.json() == [
         {
             "pk": "1",
-            "foreign_key_with_label": {"value": "1", "label": "hello"},
-            "foreign_key_with_blank_label": {"value": "3", "label": ""},
+            "foreign_key_with_label": {"value": 1, "label": "hello"},
+            "foreign_key_with_blank_label": {"value": 3, "label": ""},
             "foreign_key_with_no_label": {"value": "1", "label": "1"},
             "foreign_key_compound_pk1": "a",
             "foreign_key_compound_pk2": "b",
@@ -1362,3 +1348,37 @@ async def test_col_nocol_errors(ds_client, path, expected_error):
     response = await ds_client.get(path)
     assert response.status_code == 400
     assert response.json()["error"] == expected_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra,expected_json",
+    (
+        (
+            "columns",
+            {
+                "ok": True,
+                "next": None,
+                "columns": ["id", "content", "content2"],
+                "rows": [{"id": "1", "content": "hey", "content2": "world"}],
+                "truncated": False,
+            },
+        ),
+        (
+            "count",
+            {
+                "ok": True,
+                "next": None,
+                "rows": [{"id": "1", "content": "hey", "content2": "world"}],
+                "truncated": False,
+                "count": 1,
+            },
+        ),
+    ),
+)
+async def test_table_extras(ds_client, extra, expected_json):
+    response = await ds_client.get(
+        "/fixtures/primary_key_multiple_columns.json?_extra=" + extra
+    )
+    assert response.status_code == 200
+    assert response.json() == expected_json

@@ -1,4 +1,4 @@
-from .utils import tilde_encode, path_with_format, HASH_LENGTH, PrefixedUrlString
+from .utils import tilde_encode, path_with_format, PrefixedUrlString
 import urllib
 
 
@@ -30,6 +30,12 @@ class Urls:
     def database(self, database, format=None):
         db = self.ds.get_database(database)
         return self.path(tilde_encode(db.route), format=format)
+
+    def database_query(self, database, sql, format=None):
+        path = f"{self.database(database)}/-/query?" + urllib.parse.urlencode(
+            {"sql": sql}
+        )
+        return self.path(path, format=format)
 
     def table(self, database, table, format=None):
         path = f"{self.database(database)}/{tilde_encode(table)}"

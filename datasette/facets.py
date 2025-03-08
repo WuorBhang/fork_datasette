@@ -11,8 +11,8 @@ from datasette.utils import (
 )
 
 
-def load_facet_configs(request, table_metadata):
-    # Given a request and the metadata configuration for a table, return
+def load_facet_configs(request, table_config):
+    # Given a request and the configuration for a table, return
     # a dictionary of selected facets, their lists of configs and for each
     # config whether it came from the request or the metadata.
     #
@@ -20,21 +20,21 @@ def load_facet_configs(request, table_metadata):
     #       {"source": "metadata", "config": config1},
     #       {"source": "request", "config": config2}]}
     facet_configs = {}
-    table_metadata = table_metadata or {}
-    metadata_facets = table_metadata.get("facets", [])
-    for metadata_config in metadata_facets:
-        if isinstance(metadata_config, str):
+    table_config = table_config or {}
+    table_facet_configs = table_config.get("facets", [])
+    for facet_config in table_facet_configs:
+        if isinstance(facet_config, str):
             type = "column"
-            metadata_config = {"simple": metadata_config}
+            facet_config = {"simple": facet_config}
         else:
             assert (
-                len(metadata_config.values()) == 1
+                len(facet_config.values()) == 1
             ), "Metadata config dicts should be {type: config}"
-            type, metadata_config = list(metadata_config.items())[0]
-            if isinstance(metadata_config, str):
-                metadata_config = {"simple": metadata_config}
+            type, facet_config = list(facet_config.items())[0]
+            if isinstance(facet_config, str):
+                facet_config = {"simple": facet_config}
         facet_configs.setdefault(type, []).append(
-            {"source": "metadata", "config": metadata_config}
+            {"source": "metadata", "config": facet_config}
         )
     qs_pairs = urllib.parse.parse_qs(request.query_string, keep_blank_values=True)
     for key, values in qs_pairs.items():
@@ -45,13 +45,12 @@ def load_facet_configs(request, table_metadata):
             elif key.startswith("_facet_"):
                 type = key[len("_facet_") :]
             for value in values:
-                # The value is the config - either JSON or not
-                if value.startswith("{"):
-                    config = json.loads(value)
-                else:
-                    config = {"simple": value}
+                # The value is the facet_config - either JSON or not
+                facet_config = (
+                    json.loads(value) if value.startswith("{") else {"simple": value}
+                )
                 facet_configs.setdefault(type, []).append(
-                    {"source": "request", "config": config}
+                    {"source": "request", "config": facet_config}
                 )
     return facet_configs
 
@@ -66,6 +65,8 @@ def register_facet_classes():
 
 class Facet:
     type = None
+    # How many rows to consider when suggesting facets:
+    suggest_consider = 1000
 
     def __init__(
         self,
@@ -75,7 +76,7 @@ class Facet:
         sql=None,
         table=None,
         params=None,
-        metadata=None,
+        table_config=None,
         row_count=None,
     ):
         assert table or sql, "Must provide either table= or sql="
@@ -86,12 +87,12 @@ class Facet:
         self.table = table
         self.sql = sql or f"select * from [{table}]"
         self.params = params or []
-        self.metadata = metadata
+        self.table_config = table_config
         # row_count can be None, in which case we calculate it ourselves:
         self.row_count = row_count
 
     def get_configs(self):
-        configs = load_facet_configs(self.request, self.metadata)
+        configs = load_facet_configs(self.request, self.table_config)
         return configs.get(self.type) or []
 
     def get_querystring_pairs(self):
@@ -104,10 +105,15 @@ class Facet:
         max_returned_rows = self.ds.setting("max_returned_rows")
         table_facet_size = None
         if self.table:
-            tables_metadata = self.ds.metadata("tables", database=self.database) or {}
-            table_metadata = tables_metadata.get(self.table) or {}
-            if table_metadata:
-                table_facet_size = table_metadata.get("facet_size")
+            config_facet_size = (
+                self.ds.config.get("databases", {})
+                .get(self.database, {})
+                .get("tables", {})
+                .get(self.table, {})
+                .get("facet_size")
+            )
+            if config_facet_size:
+                table_facet_size = config_facet_size
         custom_facet_size = self.request.args.get("_facet_size")
         if custom_facet_size:
             if custom_facet_size == "max":
@@ -141,17 +147,6 @@ class Facet:
             )
         ).columns
 
-    async def get_row_count(self):
-        if self.row_count is None:
-            self.row_count = (
-                await self.ds.execute(
-                    self.database,
-                    f"select count(*) from ({self.sql})",
-                    self.params,
-                )
-            ).rows[0][0]
-        return self.row_count
-
 
 class ColumnFacet(Facet):
     type = "column"
@@ -166,13 +161,16 @@ class ColumnFacet(Facet):
             if column in already_enabled:
                 continue
             suggested_facet_sql = """
-                select {column} as value, count(*) as n from (
-                    {sql}
-                ) where value is not null
+                with limited as (select * from ({sql}) limit {suggest_consider})
+                select {column} as value, count(*) as n from limited
+                where value is not null
                 group by value
                 limit {limit}
             """.format(
-                column=escape_sqlite(column), sql=self.sql, limit=facet_size + 1
+                column=escape_sqlite(column),
+                sql=self.sql,
+                limit=facet_size + 1,
+                suggest_consider=self.suggest_consider,
             )
             distinct_values = None
             try:
@@ -206,6 +204,17 @@ class ColumnFacet(Facet):
             except QueryInterrupted:
                 continue
         return suggested_facets
+
+    async def get_row_count(self):
+        if self.row_count is None:
+            self.row_count = (
+                await self.ds.execute(
+                    self.database,
+                    f"select count(*) from (select * from ({self.sql}) limit {self.suggest_consider})",
+                    self.params,
+                )
+            ).rows[0][0]
+        return self.row_count
 
     async def facet_results(self):
         facet_results = []
@@ -309,11 +318,14 @@ class ArrayFacet(Facet):
                 continue
             # Is every value in this column either null or a JSON array?
             suggested_facet_sql = """
+                with limited as (select * from ({sql}) limit {suggest_consider})
                 select distinct json_type({column})
-                from ({sql})
+                from limited
                 where {column} is not null and {column} != ''
             """.format(
-                column=escape_sqlite(column), sql=self.sql
+                column=escape_sqlite(column),
+                sql=self.sql,
+                suggest_consider=self.suggest_consider,
             )
             try:
                 results = await self.ds.execute(
@@ -398,7 +410,9 @@ class ArrayFacet(Facet):
                 order by
                     count(*) desc, value limit {limit}
             """.format(
-                col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1
+                col=escape_sqlite(column),
+                sql=self.sql,
+                limit=facet_size + 1,
             )
             try:
                 facet_rows_results = await self.ds.execute(
@@ -466,8 +480,8 @@ class DateFacet(Facet):
             # Does this column contain any dates in the first 100 rows?
             suggested_facet_sql = """
                 select date({column}) from (
-                    {sql}
-                ) where {column} glob "????-??-*" limit 100;
+                    select * from ({sql}) limit 100
+                ) where {column} glob "????-??-*"
             """.format(
                 column=escape_sqlite(column), sql=self.sql
             )

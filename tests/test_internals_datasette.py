@@ -1,12 +1,12 @@
 """
 Tests for the datasette.app.Datasette class
 """
+
 import dataclasses
 from datasette import Forbidden, Context
 from datasette.app import Datasette, Database
 from itsdangerous import BadSignature
 import pytest
-from typing import Optional
 
 
 @pytest.fixture
@@ -173,3 +173,26 @@ async def test_get_permission(ds_client):
     # And test KeyError
     with pytest.raises(KeyError):
         ds.get_permission("missing-permission")
+
+
+@pytest.mark.asyncio
+async def test_apply_metadata_json():
+    ds = Datasette(
+        metadata={
+            "databases": {
+                "legislators": {
+                    "tables": {"offices": {"summary": "office address or sumtin"}},
+                    "queries": {
+                        "millennial_representatives": {
+                            "summary": "Social media accounts for current legislators"
+                        }
+                    },
+                }
+            },
+            "weird_instance_value": {"nested": [1, 2, 3]},
+        },
+    )
+    await ds.invoke_startup()
+    assert (await ds.client.get("/")).status_code == 200
+    value = (await ds.get_instance_metadata()).get("weird_instance_value")
+    assert value == '{"nested": [1, 2, 3]}'

@@ -1,9 +1,9 @@
 import asyncio
 from collections import namedtuple
 from pathlib import Path
-import hashlib
 import janus
 import queue
+import sqlite_utils
 import sys
 import threading
 import uuid
@@ -15,11 +15,13 @@ from .utils import (
     detect_spatialite,
     get_all_foreign_keys,
     get_outbound_foreign_keys,
+    md5_not_usedforsecurity,
     sqlite_timelimit,
     sqlite3,
     table_columns,
     table_column_details,
 )
+from .utils.sqlite import sqlite_version
 from .inspect import inspect_hash
 
 connections = threading.local()
@@ -28,6 +30,10 @@ AttachedDatabase = namedtuple("AttachedDatabase", ("seq", "name", "file"))
 
 
 class Database:
+    # For table counts stop at this many rows:
+    count_limit = 10000
+    _thread_local_id_counter = 1
+
     def __init__(
         self,
         ds,
@@ -38,6 +44,8 @@ class Database:
         mode=None,
     ):
         self.name = None
+        self._thread_local_id = f"x{self._thread_local_id_counter}"
+        Database._thread_local_id_counter += 1
         self.route = None
         self.ds = ds
         self.path = path
@@ -74,7 +82,7 @@ class Database:
     def color(self):
         if self.hash:
             return self.hash[:6]
-        return hashlib.md5(self.name.encode("utf8")).hexdigest()[:6]
+        return md5_not_usedforsecurity(self.name)[:6]
 
     def suggest_name(self):
         if self.path:
@@ -85,12 +93,13 @@ class Database:
             return "db"
 
     def connect(self, write=False):
+        extra_kwargs = {}
+        if write:
+            extra_kwargs["isolation_level"] = "IMMEDIATE"
         if self.memory_name:
             uri = "file:{}?mode=memory&cache=shared".format(self.memory_name)
             conn = sqlite3.connect(
-                uri,
-                uri=True,
-                check_same_thread=False,
+                uri, uri=True, check_same_thread=False, **extra_kwargs
             )
             if not write:
                 conn.execute("PRAGMA query_only=1")
@@ -111,7 +120,7 @@ class Database:
         if self.mode is not None:
             qs = f"?mode={self.mode}"
         conn = sqlite3.connect(
-            f"file:{self.path}{qs}", uri=True, check_same_thread=False
+            f"file:{self.path}{qs}", uri=True, check_same_thread=False, **extra_kwargs
         )
         self._all_file_connections.append(conn)
         return conn
@@ -123,8 +132,7 @@ class Database:
 
     async def execute_write(self, sql, params=None, block=True):
         def _inner(conn):
-            with conn:
-                return conn.execute(sql, params or [])
+            return conn.execute(sql, params or [])
 
         with trace("sql", database=self.name, sql=sql.strip(), params=params):
             results = await self.execute_write_fn(_inner, block=block)
@@ -132,8 +140,7 @@ class Database:
 
     async def execute_write_script(self, sql, block=True):
         def _inner(conn):
-            with conn:
-                return conn.executescript(sql)
+            return conn.executescript(sql)
 
         with trace("sql", database=self.name, sql=sql.strip(), executescript=True):
             results = await self.execute_write_fn(_inner, block=block)
@@ -149,8 +156,7 @@ class Database:
                     count += 1
                     yield param
 
-            with conn:
-                return conn.executemany(sql, count_params(params_seq)), count
+            return conn.executemany(sql, count_params(params_seq)), count
 
         with trace(
             "sql", database=self.name, sql=sql.strip(), executemany=True
@@ -159,25 +165,60 @@ class Database:
             kwargs["count"] = count
         return results
 
-    async def execute_write_fn(self, fn, block=True):
+    async def execute_isolated_fn(self, fn):
+        # Open a new connection just for the duration of this function
+        # blocking the write queue to avoid any writes occurring during it
+        if self.ds.executor is None:
+            # non-threaded mode
+            isolated_connection = self.connect(write=True)
+            try:
+                result = fn(isolated_connection)
+            finally:
+                isolated_connection.close()
+                try:
+                    self._all_file_connections.remove(isolated_connection)
+                except ValueError:
+                    # Was probably a memory connection
+                    pass
+            return result
+        else:
+            # Threaded mode - send to write thread
+            return await self._send_to_write_thread(fn, isolated_connection=True)
+
+    async def execute_write_fn(self, fn, block=True, transaction=True):
         if self.ds.executor is None:
             # non-threaded mode
             if self._write_connection is None:
                 self._write_connection = self.connect(write=True)
                 self.ds._prepare_connection(self._write_connection, self.name)
-            return fn(self._write_connection)
+            if transaction:
+                with self._write_connection:
+                    return fn(self._write_connection)
+            else:
+                return fn(self._write_connection)
+        else:
+            return await self._send_to_write_thread(
+                fn, block=block, transaction=transaction
+            )
 
-        # threaded mode
-        task_id = uuid.uuid5(uuid.NAMESPACE_DNS, "datasette.io")
+    async def _send_to_write_thread(
+        self, fn, block=True, isolated_connection=False, transaction=True
+    ):
         if self._write_queue is None:
             self._write_queue = queue.Queue()
         if self._write_thread is None:
             self._write_thread = threading.Thread(
                 target=self._execute_writes, daemon=True
             )
+            self._write_thread.name = "_execute_writes for database {}".format(
+                self.name
+            )
             self._write_thread.start()
+        task_id = uuid.uuid5(uuid.NAMESPACE_DNS, "datasette.io")
         reply_queue = janus.Queue()
-        self._write_queue.put(WriteTask(fn, task_id, reply_queue))
+        self._write_queue.put(
+            WriteTask(fn, task_id, reply_queue, isolated_connection, transaction)
+        )
         if block:
             result = await reply_queue.async_q.get()
             if isinstance(result, Exception):
@@ -202,12 +243,32 @@ class Database:
             if conn_exception is not None:
                 result = conn_exception
             else:
-                try:
-                    result = task.fn(conn)
-                except Exception as e:
-                    sys.stderr.write("{}\n".format(e))
-                    sys.stderr.flush()
-                    result = e
+                if task.isolated_connection:
+                    isolated_connection = self.connect(write=True)
+                    try:
+                        result = task.fn(isolated_connection)
+                    except Exception as e:
+                        sys.stderr.write("{}\n".format(e))
+                        sys.stderr.flush()
+                        result = e
+                    finally:
+                        isolated_connection.close()
+                        try:
+                            self._all_file_connections.remove(isolated_connection)
+                        except ValueError:
+                            # Was probably a memory connection
+                            pass
+                else:
+                    try:
+                        if task.transaction:
+                            with conn:
+                                result = task.fn(conn)
+                        else:
+                            result = task.fn(conn)
+                    except Exception as e:
+                        sys.stderr.write("{}\n".format(e))
+                        sys.stderr.flush()
+                        result = e
             task.reply_queue.sync_q.put(result)
 
     async def execute_fn(self, fn):
@@ -220,11 +281,11 @@ class Database:
 
         # threaded mode
         def in_thread():
-            conn = getattr(connections, self.name, None)
+            conn = getattr(connections, self._thread_local_id, None)
             if not conn:
                 conn = self.connect()
                 self.ds._prepare_connection(conn, self.name)
-                setattr(connections, self.name, conn)
+                setattr(connections, self._thread_local_id, conn)
             return fn(conn)
 
         return await asyncio.get_event_loop().run_in_executor(
@@ -322,7 +383,7 @@ class Database:
             try:
                 table_count = (
                     await self.execute(
-                        f"select count(*) from [{table}]",
+                        f"select count(*) from (select * from [{table}] limit {self.count_limit + 1})",
                         custom_time_limit=limit,
                     )
                 ).rows[0][0]
@@ -380,12 +441,38 @@ class Database:
         return await self.execute_fn(lambda conn: detect_fts(conn, table))
 
     async def label_column_for_table(self, table):
-        explicit_label_column = self.ds.table_metadata(self.name, table).get(
+        explicit_label_column = (await self.ds.table_config(self.name, table)).get(
             "label_column"
         )
         if explicit_label_column:
             return explicit_label_column
-        column_names = await self.execute_fn(lambda conn: table_columns(conn, table))
+
+        def column_details(conn):
+            # Returns {column_name: (type, is_unique)}
+            db = sqlite_utils.Database(conn)
+            columns = db[table].columns_dict
+            indexes = db[table].indexes
+            details = {}
+            for name in columns:
+                is_unique = any(
+                    index
+                    for index in indexes
+                    if index.columns == [name] and index.unique
+                )
+                details[name] = (columns[name], is_unique)
+            return details
+
+        column_details = await self.execute_fn(column_details)
+        # Is there just one unique column that's text?
+        unique_text_columns = [
+            name
+            for name, (type_, is_unique) in column_details.items()
+            if is_unique and type_ is str
+        ]
+        if len(unique_text_columns) == 1:
+            return unique_text_columns[0]
+
+        column_names = list(column_details.keys())
         # Is there a name or title column?
         name_or_title = [c for c in column_names if c.lower() in ("name", "title")]
         if name_or_title:
@@ -395,6 +482,7 @@ class Database:
             column_names
             and len(column_names) == 2
             and ("id" in column_names or "pk" in column_names)
+            and not set(column_names) == {"id", "pk"}
         ):
             return [c for c in column_names if c not in ("id", "pk")][0]
         # Couldn't find a label:
@@ -406,21 +494,95 @@ class Database:
         )
 
     async def hidden_table_names(self):
-        # Mark tables 'hidden' if they relate to FTS virtual tables
-        hidden_tables = [
-            r[0]
-            for r in (
-                await self.execute(
+        hidden_tables = []
+        # Add any tables marked as hidden in config
+        db_config = self.ds.config.get("databases", {}).get(self.name, {})
+        if "tables" in db_config:
+            hidden_tables += [
+                t for t in db_config["tables"] if db_config["tables"][t].get("hidden")
+            ]
+
+        if sqlite_version()[1] >= 37:
+            hidden_tables += [
+                x[0]
+                for x in await self.execute(
                     """
-                select name from sqlite_master
-                where rootpage = 0
-                and (
-                    sql like '%VIRTUAL TABLE%USING FTS%'
-                ) or name in ('sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4')
-            """
+                      with shadow_tables as (
+                        select name
+                        from pragma_table_list
+                        where [type] = 'shadow'
+                        order by name
+                      ),
+                      core_tables as (
+                        select name
+                        from sqlite_master
+                        WHERE  name in ('sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4')
+                          OR substr(name, 1, 1) == '_'
+                      ),
+                      combined as (
+                        select name from shadow_tables
+                        union all
+                        select name from core_tables
+                      )
+                      select name from combined order by 1
+                    """
                 )
-            ).rows
-        ]
+            ]
+        else:
+            hidden_tables += [
+                x[0]
+                for x in await self.execute(
+                    """
+                      WITH base AS (
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE  name IN ('sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4')
+                          OR substr(name, 1, 1) == '_'
+                      ),
+                      fts_suffixes AS (
+                        SELECT column1 AS suffix
+                        FROM (VALUES ('_data'), ('_idx'), ('_docsize'), ('_content'), ('_config'))
+                      ),
+                      fts5_names AS (
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE sql LIKE '%VIRTUAL TABLE%USING FTS%'
+                      ),
+                      fts5_shadow_tables AS (
+                        SELECT
+                          printf('%s%s', fts5_names.name, fts_suffixes.suffix) AS name
+                        FROM fts5_names
+                        JOIN fts_suffixes
+                      ),
+                      fts3_suffixes AS (
+                        SELECT column1 AS suffix
+                        FROM (VALUES ('_content'), ('_segdir'), ('_segments'), ('_stat'), ('_docsize'))
+                      ),
+                      fts3_names AS (
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE sql LIKE '%VIRTUAL TABLE%USING FTS3%'
+                          OR sql LIKE '%VIRTUAL TABLE%USING FTS4%'
+                      ),
+                      fts3_shadow_tables AS (
+                        SELECT
+                          printf('%s%s', fts3_names.name, fts3_suffixes.suffix) AS name
+                        FROM fts3_names
+                        JOIN fts3_suffixes
+                      ),
+                      final AS (
+                        SELECT name FROM base
+                        UNION ALL
+                        SELECT name FROM fts5_shadow_tables
+                        UNION ALL
+                        SELECT name FROM fts3_shadow_tables
+                      )
+                      SELECT name FROM final ORDER BY 1
+
+                    """
+                )
+            ]
+
         has_spatialite = await self.execute_fn(detect_spatialite)
         if has_spatialite:
             # Also hide Spatialite internal tables
@@ -449,21 +611,6 @@ class Database:
                     )
                 ).rows
             ]
-        # Add any from metadata.json
-        db_metadata = self.ds.metadata(database=self.name)
-        if "tables" in db_metadata:
-            hidden_tables += [
-                t
-                for t in db_metadata["tables"]
-                if db_metadata["tables"][t].get("hidden")
-            ]
-        # Also mark as hidden any tables which start with the name of a hidden table
-        # e.g. "searchable_fts" implies "searchable_fts_content" should be hidden
-        for table_name in await self.table_names():
-            for hidden_table in hidden_tables[:]:
-                if table_name.startswith(hidden_table):
-                    hidden_tables.append(table_name)
-                    continue
 
         return hidden_tables
 
@@ -515,12 +662,14 @@ class Database:
 
 
 class WriteTask:
-    __slots__ = ("fn", "task_id", "reply_queue")
+    __slots__ = ("fn", "task_id", "reply_queue", "isolated_connection", "transaction")
 
-    def __init__(self, fn, task_id, reply_queue):
+    def __init__(self, fn, task_id, reply_queue, isolated_connection, transaction):
         self.fn = fn
         self.task_id = task_id
         self.reply_queue = reply_queue
+        self.isolated_connection = isolated_connection
+        self.transaction = transaction
 
 
 class QueryInterrupted(Exception):
@@ -528,6 +677,9 @@ class QueryInterrupted(Exception):
         self.e = e
         self.sql = sql
         self.params = params
+
+    def __str__(self):
+        return "QueryInterrupted: {}".format(self.e)
 
 
 class MultipleValues(Exception):
@@ -555,6 +707,9 @@ class Results:
             return self.rows[0][0]
         else:
             raise MultipleValues
+
+    def dicts(self):
+        return [dict(row) for row in self.rows]
 
     def __iter__(self):
         return iter(self.rows)

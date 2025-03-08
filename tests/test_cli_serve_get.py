@@ -1,4 +1,4 @@
-from datasette.cli import cli, serve
+from datasette.cli import cli
 from datasette.plugins import pm
 from click.testing import CliRunner
 import textwrap
@@ -31,7 +31,7 @@ def test_serve_with_get(tmp_path_factory):
             "--plugins-dir",
             str(plugins_dir),
             "--get",
-            "/_memory.json?sql=select+sqlite_version()",
+            "/_memory/-/query.json?sql=select+sqlite_version()",
         ],
     )
     assert result.exit_code == 0, result.output

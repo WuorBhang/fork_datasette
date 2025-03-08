@@ -17,33 +17,17 @@
 {% block body_class %}table db-{{ database|to_css_class }} table-{{ table|to_css_class }}{% endblock %}
 
 {% block crumbs %}
-{{ crumbs.nav(request=request, database=database) }}
+{{ crumbs.nav(request=request, database=database, table=table) }}
 {% endblock %}
 
 {% block content %}
 <div class="page-header" style="border-color: #{{ database_color }}">
     <h1>{{ metadata.get("title") or table }}{% if is_view %} (view){% endif %}{% if private %} 🔒{% endif %}</h1>
-    {% set links = table_actions() %}{% if links %}
-    <details class="actions-menu-links details-menu">
-        <summary><svg aria-labelledby="actions-menu-links-title" role="img"
-                style="color: #666" xmlns="http://www.w3.org/2000/svg"
-                width="28" height="28" viewBox="0 0 24 24" fill="none"
-                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <title id="actions-menu-links-title">Table actions</title>
-            <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-        </svg></summary>
-        <div class="dropdown-menu">
-            {% if links %}
-            <ul>
-                {% for link in links %}
-                <li><a href="{{ link.href }}">{{ link.label }}</a></li>
-                {% endfor %}
-            </ul>
-            {% endif %}
-        </div>
-    </details>{% endif %}
 </div>
+{% set action_links, action_title = actions(), "View actions" if is_view else "Table actions" %}
+{% include "_action_menu.html" %}
+
+{{ top_table() }}
 
 {% block description_source_license %}{% include "_description_source_license.html" %}{% endblock %}
 
@@ -56,12 +40,15 @@
 {% endif %}
 
 {% if count or human_description_en %}
-    <h3>{% if count or count == 0 %}{{ "{:,}".format(count) }} row{% if count == 1 %}{% else %}s{% endif %}{% endif %}
+    <h3>
+        {% if count == count_limit + 1 %}&gt;{{ "{:,}".format(count_limit) }} rows
+        {% if allow_execute_sql and query.sql %} <a class="count-sql" style="font-size: 0.8em;" href="{{ urls.database_query(database, count_sql) }}">count all</a>{% endif %}
+        {% elif count or count == 0 %}{{ "{:,}".format(count) }} row{% if count == 1 %}{% else %}s{% endif %}{% endif %}
         {% if human_description_en %}{{ human_description_en }}{% endif %}
     </h3>
 {% endif %}
 
-<form class="filters" action="{{ urls.table(database, table) }}" method="get">
+<form class="core" class="filters" action="{{ urls.table(database, table) }}" method="get">
     {% if supports_search %}
         <div class="search-row"><label for="_search">Search:</label><input id="_search" type="search" name="_search" value="{{ search }}"></div>
     {% endif %}
@@ -165,7 +152,7 @@
                 <a href="{{ append_querystring(renderers['json'], '_shape=object') }}">object</a>
             {% endif %}
         </p>
-        <form action="{{ url_csv_path }}" method="get">
+        <form class="core" action="{{ url_csv_path }}" method="get">
             <p>
                 CSV options:
                 <label><input type="checkbox" name="_dl"> download file</label>
@@ -186,6 +173,43 @@
 
 {% if view_definition %}
     <pre class="wrapped-sql">{{ view_definition }}</pre>
+{% endif %}
+
+{% if allow_execute_sql and query.sql %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const countLink = document.querySelector('a.count-sql');
+    if (countLink) {
+        countLink.addEventListener('click', async function(ev) {
+            ev.preventDefault();
+            // Replace countLink with span with same style attribute
+            const span = document.createElement('span');
+            span.textContent = 'counting...';
+            span.setAttribute('style', countLink.getAttribute('style'));
+            countLink.replaceWith(span);
+            countLink.setAttribute('disabled', 'disabled');
+            let url = countLink.href.replace(/(\?|$)/, '.json$1');
+            try {
+                const response = await fetch(url);
+                console.log({response});
+                const data = await response.json();
+                console.log({data});
+                if (!response.ok) {
+                    console.log('throw error');
+                    throw new Error(data.title || data.error);
+                }
+                const count = data['rows'][0]['count(*)'];
+                const formattedCount = count.toLocaleString();
+                span.closest('h3').textContent = formattedCount + ' rows';
+            } catch (error) {
+                console.log('Update', span, 'with error message', error);
+                span.textContent = error.message;
+                span.style.color = 'red';
+            }
+        });
+    }
+});
+</script>
 {% endif %}
 
 {% endblock %}

@@ -15,7 +15,6 @@ import sys
 import textwrap
 import webbrowser
 from .app import (
-    OBSOLETE_SETTINGS,
     Datasette,
     DEFAULT_SETTINGS,
     SETTINGS,
@@ -26,6 +25,7 @@ from .utils import (
     LoadExtension,
     StartupError,
     check_connection,
+    deep_dict_update,
     find_spatialite,
     parse_metadata,
     ConnectionProblem,
@@ -33,7 +33,6 @@ from .utils import (
     initial_path_for_datasette,
     pairs_to_nested_config,
     temporary_docker_directory,
-    fail_if_plugins_in_metadata,
     value_as_boolean,
     SpatialiteNotFound,
     StaticMount,
@@ -86,7 +85,7 @@ def sqlite_extensions(fn):
         "sqlite_extensions",
         "--load-extension",
         type=LoadExtension(),
-        envvar="SQLITE_EXTENSIONS",
+        envvar="DATASETTE_LOAD_EXTENSION",
         multiple=True,
         help="Path to a SQLite extension to load, and optional entrypoint",
     )(fn)
@@ -469,10 +468,12 @@ def uninstall(packages, yes):
 @click.option(
     "--ssl-keyfile",
     help="SSL key file",
+    envvar="DATASETTE_SSL_KEYFILE",
 )
 @click.option(
     "--ssl-certfile",
     help="SSL certificate file",
+    envvar="DATASETTE_SSL_CERTFILE",
 )
 @click.option(
     "--internal",
@@ -543,7 +544,7 @@ def serve(
 
     metadata_data = None
     if metadata:
-        metadata_data = fail_if_plugins_in_metadata(parse_metadata(metadata.read()))
+        metadata_data = parse_metadata(metadata.read())
 
     config_data = None
     if config:
@@ -554,7 +555,9 @@ def serve(
     # Merge in settings from -s/--setting
     if settings:
         settings_updates = pairs_to_nested_config(settings)
-        config_data.update(settings_updates)
+        # Merge recursively, to avoid over-writing nested values
+        # https://github.com/simonw/datasette/issues/2389
+        deep_dict_update(config_data, settings_updates)
 
     kwargs = dict(
         immutables=immutable,

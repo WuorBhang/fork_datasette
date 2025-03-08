@@ -111,9 +111,13 @@ Debugging
 
 Any errors that occur while Datasette is running while display a stack trace on the console.
 
-You can tell Datasette to open an interactive ``pdb`` debugger session if an error occurs using the ``--pdb`` option::
+You can tell Datasette to open an interactive ``pdb`` (or ``ipdb``, if present) debugger session if an error occurs using the ``--pdb`` option::
 
     datasette --pdb fixtures.db
+
+For `ipdb <https://pypi.org/project/ipdb/>`__, first run this::
+
+    datasette install ipdb
 
 .. _contributing_formatting:
 
@@ -254,6 +258,7 @@ Datasette releases are performed using tags. When a new release is published on 
 * Re-point the "latest" tag on Docker Hub to the new image
 * Build a wheel bundle of the underlying Python source code
 * Push that new wheel up to PyPI: https://pypi.org/project/datasette/
+* If the release is an alpha, navigate to https://readthedocs.org/projects/datasette/versions/ and search for the tag name in the "Activate a version" filter, then mark that version as "active" to ensure it will appear on the public ReadTheDocs documentation site.
 
 To deploy new releases you will need to have push access to the main Datasette GitHub repository.
 
@@ -282,6 +287,10 @@ Referencing the issues that are part of the release in the commit message ensure
 You can generate the list of issue references for a specific release by copying and pasting text from the release notes or GitHub changes-since-last-release view into this `Extract issue numbers from pasted text <https://observablehq.com/@simonw/extract-issue-numbers-from-pasted-text>`__ tool.
 
 To create the tag for the release, create `a new release <https://github.com/simonw/datasette/releases/new>`__ on GitHub matching the new version number. You can convert the release notes to Markdown by copying and pasting the rendered HTML into this `Paste to Markdown tool <https://euangoddard.github.io/clipboard2markdown/>`__.
+
+Don't forget to create the release from the correct branch - usually ``main``, but sometimes ``0.64.x`` or similar for a bugfix release.
+
+While the release is running you can confirm that the correct commits made it into the release using the https://github.com/simonw/datasette/compare/0.64.6...0.64.7 URL.
 
 Finally, post a news item about the release on `datasette.io <https://datasette.io/>`__ by editing the `news.yaml <https://github.com/simonw/datasette.io/blob/main/news.yaml>`__ file in that site's repository.
 

@@ -5,17 +5,21 @@ from datasette import tracer
 from datasette.utils import path_with_added_args
 from datasette.utils.asgi import asgi_send_json, Response
 import base64
-import pint
 import json
-
-ureg = pint.UnitRegistry()
+import urllib.parse
 
 
 @hookimpl
 def prepare_connection(conn, database, datasette):
     def convert_units(amount, from_, to_):
         """select convert_units(100, 'm', 'ft');"""
-        return (amount * ureg(from_)).to(to_).to_tuple()[0]
+        # Convert meters to feet
+        if from_ == "m" and to_ == "ft":
+            return amount * 3.28084
+        # Convert feet to meters
+        if from_ == "ft" and to_ == "m":
+            return amount / 3.28084
+        assert False, "Unsupported conversion"
 
     conn.create_function("convert_units", 3, convert_units)
 
@@ -39,9 +43,9 @@ def extra_css_urls(template, database, table, view_name, columns, request, datas
                             "database": database,
                             "table": table,
                             "view_name": view_name,
-                            "request_path": request.path
-                            if request is not None
-                            else None,
+                            "request_path": (
+                                request.path if request is not None else None
+                            ),
                             "added": (
                                 await datasette.get_database().execute("select 3 * 5")
                             ).first()[0],
@@ -275,9 +279,7 @@ def register_routes():
         # Mainly for the latest.datasette.io demo
         if request.method == "POST":
             response = Response.redirect("/")
-            response.set_cookie(
-                "ds_actor", datasette.sign({"a": {"id": "root"}}, "actor")
-            )
+            datasette.set_actor_cookie(response, {"id": "root"})
             return response
         return Response.html(
             """
@@ -356,9 +358,13 @@ def register_magic_parameters():
         else:
             raise KeyError
 
+    async def asyncrequest(key, request):
+        return key
+
     return [
         ("request", request),
         ("uuid", uuid),
+        ("asyncrequest", asyncrequest),
     ]
 
 
@@ -391,6 +397,51 @@ def table_actions(datasette, database, table, actor):
 
 
 @hookimpl
+def view_actions(datasette, database, view, actor):
+    if actor:
+        return [
+            {
+                "href": datasette.urls.instance(),
+                "label": f"Database: {database}",
+            },
+            {"href": datasette.urls.instance(), "label": f"View: {view}"},
+        ]
+
+
+@hookimpl
+def query_actions(datasette, database, query_name, sql):
+    # Don't explain an explain
+    if sql.lower().startswith("explain"):
+        return
+    return [
+        {
+            "href": datasette.urls.database(database)
+            + "/-/query"
+            + "?"
+            + urllib.parse.urlencode(
+                {
+                    "sql": "explain " + sql,
+                }
+            ),
+            "label": "Explain this query",
+            "description": "Runs a SQLite explain",
+        },
+    ]
+
+
+@hookimpl
+def row_actions(datasette, database, table, actor, row):
+    if actor:
+        return [
+            {
+                "href": datasette.urls.instance(),
+                "label": f"Row details for {actor['id']}",
+                "description": json.dumps(dict(row), default=repr),
+            },
+        ]
+
+
+@hookimpl
 def database_actions(datasette, database, actor, request):
     if actor:
         label = f"Database: {database}"
@@ -399,6 +450,18 @@ def database_actions(datasette, database, actor, request):
         return [
             {
                 "href": datasette.urls.instance(),
+                "label": label,
+            }
+        ]
+
+
+@hookimpl
+def homepage_actions(datasette, actor, request):
+    if actor:
+        label = f"Custom homepage for: {actor['id']}"
+        return [
+            {
+                "href": datasette.urls.path("/-/custom-homepage"),
                 "label": label,
             }
         ]

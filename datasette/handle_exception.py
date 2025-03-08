@@ -1,14 +1,16 @@
 from datasette import hookimpl, Response
-from .utils import await_me_maybe, add_cors_headers
+from .utils import add_cors_headers
 from .utils.asgi import (
     Base400,
-    Forbidden,
 )
 from .views.base import DatasetteError
 from markupsafe import Markup
-import pdb
 import traceback
-from .plugins import pm
+
+try:
+    import ipdb as pdb
+except ImportError:
+    import pdb
 
 try:
     import rich
@@ -57,7 +59,8 @@ def handle_exception(datasette, request, exception):
         if request.path.split("?")[0].endswith(".json"):
             return Response.json(info, status=status, headers=headers)
         else:
-            template = datasette.jinja_env.select_template(templates)
+            environment = datasette.get_jinja_environment(request)
+            template = environment.select_template(templates)
             return Response.html(
                 await template.render_async(
                     dict(

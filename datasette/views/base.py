@@ -8,9 +8,6 @@ import urllib
 from markupsafe import escape
 
 
-import pint
-
-from datasette import __version__
 from datasette.database import QueryInterrupted
 from datasette.utils.asgi import Request
 from datasette.utils import (
@@ -32,8 +29,6 @@ from datasette.utils.asgi import (
     Response,
     BadRequest,
 )
-
-ureg = pint.UnitRegistry()
 
 
 class DatasetteError(Exception):
@@ -143,7 +138,8 @@ class BaseView:
 
     async def render(self, templates, request, context=None):
         context = context or {}
-        template = self.ds.jinja_env.select_template(templates)
+        environment = self.ds.get_jinja_environment(request)
+        template = environment.select_template(templates)
         template_context = {
             **context,
             **{
@@ -274,10 +270,6 @@ class DataView(BaseView):
 
         end = time.perf_counter()
         data["query_ms"] = (end - start) * 1000
-        for key in ("source", "source_url", "license", "license_url"):
-            value = self.ds.metadata(key)
-            if value:
-                data[key] = value
 
         # Special case for .jsono extension - redirect to _shape=objects
         if _format == "jsono":
@@ -385,7 +377,7 @@ class DataView(BaseView):
                 },
             }
             if "metadata" not in context:
-                context["metadata"] = self.ds.metadata()
+                context["metadata"] = await self.ds.get_instance_metadata()
             r = await self.render(templates, request=request, context=context)
             if status_code is not None:
                 r.status = status_code
@@ -484,7 +476,6 @@ async def stream_csv(datasette, fetch_data, request, database):
 
     async def stream_fn(r):
         nonlocal data, trace
-        print("max_csv_mb", datasette.setting("max_csv_mb"))
         limited_writer = LimitedWriter(r, datasette.setting("max_csv_mb"))
         if trace:
             await limited_writer.write(preamble)
@@ -554,16 +545,18 @@ async def stream_csv(datasette, fetch_data, request, database):
                                 if cell is None:
                                     new_row.extend(("", ""))
                                 else:
-                                    assert isinstance(cell, dict)
-                                    new_row.append(cell["value"])
-                                    new_row.append(cell["label"])
+                                    if not isinstance(cell, dict):
+                                        new_row.extend((cell, ""))
+                                    else:
+                                        new_row.append(cell["value"])
+                                        new_row.append(cell["label"])
                             else:
                                 new_row.append(cell)
                         await writer.writerow(new_row)
-            except Exception as e:
-                sys.stderr.write("Caught this error: {}\n".format(e))
+            except Exception as ex:
+                sys.stderr.write("Caught this error: {}\n".format(ex))
                 sys.stderr.flush()
-                await r.write(str(e))
+                await r.write(str(ex))
                 return
         await limited_writer.write(postamble)
 

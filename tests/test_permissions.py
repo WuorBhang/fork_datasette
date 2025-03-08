@@ -89,10 +89,11 @@ def test_view_padlock(allow, expected_anon, expected_auth, path, padlock_client)
         ({"id": "root"}, 403, 200),
     ],
 )
-def test_view_database(allow, expected_anon, expected_auth):
-    with make_app_client(
-        config={"databases": {"fixtures": {"allow": allow}}}
-    ) as client:
+@pytest.mark.parametrize("use_metadata", (True, False))
+def test_view_database(allow, expected_anon, expected_auth, use_metadata):
+    key = "metadata" if use_metadata else "config"
+    kwargs = {key: {"databases": {"fixtures": {"allow": allow}}}}
+    with make_app_client(**kwargs) as client:
         for path in (
             "/fixtures",
             "/fixtures/compound_three_primary_keys",
@@ -173,16 +174,19 @@ def test_database_list_respects_view_table():
         ({"id": "root"}, 403, 200),
     ],
 )
-def test_view_table(allow, expected_anon, expected_auth):
-    with make_app_client(
-        config={
+@pytest.mark.parametrize("use_metadata", (True, False))
+def test_view_table(allow, expected_anon, expected_auth, use_metadata):
+    key = "metadata" if use_metadata else "config"
+    kwargs = {
+        key: {
             "databases": {
                 "fixtures": {
                     "tables": {"compound_three_primary_keys": {"allow": allow}}
                 }
             }
         }
-    ) as client:
+    }
+    with make_app_client(**kwargs) as client:
         anon_response = client.get("/fixtures/compound_three_primary_keys")
         assert expected_anon == anon_response.status
         if allow and anon_response.status == 200:
@@ -264,7 +268,7 @@ def test_view_query(allow, expected_anon, expected_auth):
 def test_execute_sql(config):
     schema_re = re.compile("const schema = ({.*?});", re.DOTALL)
     with make_app_client(config=config) as client:
-        form_fragment = '<form class="sql" action="/fixtures"'
+        form_fragment = '<form class="sql core" action="/fixtures/-/query"'
 
         # Anonymous users - should not display the form:
         anon_html = client.get("/fixtures").text
@@ -272,7 +276,7 @@ def test_execute_sql(config):
         # And const schema should be an empty object:
         assert "const schema = {};" in anon_html
         # This should 403:
-        assert client.get("/fixtures?sql=select+1").status == 403
+        assert client.get("/fixtures/-/query?sql=select+1").status == 403
         # ?_where= not allowed on tables:
         assert client.get("/fixtures/facet_cities?_where=id=3").status == 403
 
@@ -285,7 +289,7 @@ def test_execute_sql(config):
         assert set(schema["attraction_characteristic"]) == {"name", "pk"}
         assert schema["paginated_view"] == []
         assert form_fragment in response_text
-        query_response = client.get("/fixtures?sql=select+1", cookies=cookies)
+        query_response = client.get("/fixtures/-/query?sql=select+1", cookies=cookies)
         assert query_response.status == 200
         schema2 = json.loads(schema_re.search(query_response.text).group(1))
         assert set(schema2["attraction_characteristic"]) == {"name", "pk"}
@@ -333,7 +337,7 @@ def test_query_list_respects_view_query():
             ],
         ),
         (
-            "/fixtures?sql=select+1",
+            "/fixtures/-/query?sql=select+1",
             [
                 "view-instance",
                 ("view-database", "fixtures"),
@@ -367,35 +371,84 @@ def test_permissions_checked(app_client, path, permissions):
 
 
 @pytest.mark.asyncio
-async def test_permissions_debug(ds_client):
+@pytest.mark.parametrize("filter_", ("all", "exclude-yours", "only-yours"))
+async def test_permissions_debug(ds_client, filter_):
     ds_client.ds._permission_checks.clear()
     assert (await ds_client.get("/-/permissions")).status_code == 403
     # With the cookie it should work
     cookie = ds_client.actor_cookie({"id": "root"})
-    response = await ds_client.get("/-/permissions", cookies={"ds_actor": cookie})
+    response = await ds_client.get(
+        f"/-/permissions?filter={filter_}", cookies={"ds_actor": cookie}
+    )
     assert response.status_code == 200
+    # Should have a select box listing permissions
+    for fragment in (
+        '<select name="permission" id="permission">',
+        '<option value="view-instance">view-instance (default True)</option>',
+        '<option value="insert-row">insert-row (default False)</option>',
+    ):
+        assert fragment in response.text
     # Should show one failure and one success
     soup = Soup(response.text, "html.parser")
-    check_divs = soup.findAll("div", {"class": "check"})
+    check_divs = soup.find_all("div", {"class": "check"})
     checks = [
         {
             "action": div.select_one(".check-action").text,
             # True = green tick, False = red cross, None = gray None
-            "result": None
-            if div.select(".check-result-no-opinion")
-            else bool(div.select(".check-result-true")),
+            "result": (
+                None
+                if div.select(".check-result-no-opinion")
+                else bool(div.select(".check-result-true"))
+            ),
             "used_default": bool(div.select(".check-used-default")),
+            "actor": json.loads(
+                div.find(
+                    "strong", string=lambda text: text and "Actor" in text
+                ).parent.text.split(": ", 1)[1]
+            ),
         }
         for div in check_divs
     ]
-    assert checks == [
-        {"action": "permissions-debug", "result": True, "used_default": False},
-        {"action": "view-instance", "result": None, "used_default": True},
-        {"action": "debug-menu", "result": False, "used_default": True},
-        {"action": "view-instance", "result": True, "used_default": True},
-        {"action": "permissions-debug", "result": False, "used_default": True},
-        {"action": "view-instance", "result": None, "used_default": True},
+    expected_checks = [
+        {
+            "action": "permissions-debug",
+            "result": True,
+            "used_default": False,
+            "actor": {"id": "root"},
+        },
+        {
+            "action": "view-instance",
+            "result": None,
+            "used_default": True,
+            "actor": {"id": "root"},
+        },
+        {"action": "debug-menu", "result": False, "used_default": True, "actor": None},
+        {
+            "action": "view-instance",
+            "result": True,
+            "used_default": True,
+            "actor": None,
+        },
+        {
+            "action": "permissions-debug",
+            "result": False,
+            "used_default": True,
+            "actor": None,
+        },
+        {
+            "action": "view-instance",
+            "result": None,
+            "used_default": True,
+            "actor": None,
+        },
     ]
+    if filter_ == "only-yours":
+        expected_checks = [
+            check for check in expected_checks if check["actor"] is not None
+        ]
+    elif filter_ == "exclude-yours":
+        expected_checks = [check for check in expected_checks if check["actor"] is None]
+    assert checks == expected_checks
 
 
 @pytest.mark.asyncio
@@ -440,7 +493,6 @@ def view_instance_client():
         "/",
         "/fixtures",
         "/fixtures/facetable",
-        "/-/metadata",
         "/-/versions",
         "/-/plugins",
         "/-/settings",
@@ -667,6 +719,7 @@ async def test_actor_restricted_permissions(
         "permission": permission,
         "resource": expected_resource,
         "result": expected_result,
+        "default": perms_ds.permissions[permission].default,
     }
     assert response.json() == expected
 
@@ -876,6 +929,7 @@ async def test_actor_endpoint_allows_any_token():
     }
 
 
+@pytest.mark.serial
 @pytest.mark.parametrize(
     "options,expected",
     (

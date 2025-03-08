@@ -50,7 +50,7 @@ def search_filters(request, database, table, datasette):
         extra_context = {}
 
         # Figure out which fts_table to use
-        table_metadata = datasette.table_metadata(database, table)
+        table_metadata = await datasette.table_config(database, table)
         db = datasette.get_database(database)
         fts_table = request.args.get("_fts_table")
         fts_table = fts_table or table_metadata.get("fts_table")
@@ -80,9 +80,9 @@ def search_filters(request, database, table, datasette):
                     "{fts_pk} in (select rowid from {fts_table} where {fts_table} match {match_clause})".format(
                         fts_table=escape_sqlite(fts_table),
                         fts_pk=escape_sqlite(fts_pk),
-                        match_clause=":search"
-                        if search_mode_raw
-                        else "escape_fts(:search)",
+                        match_clause=(
+                            ":search" if search_mode_raw else "escape_fts(:search)"
+                        ),
                     )
                 )
                 human_descriptions.append(f'search matches "{search}"')
@@ -99,9 +99,11 @@ def search_filters(request, database, table, datasette):
                         "rowid in (select rowid from {fts_table} where {search_col} match {match_clause})".format(
                             fts_table=escape_sqlite(fts_table),
                             search_col=escape_sqlite(search_col),
-                            match_clause=":search_{}".format(i)
-                            if search_mode_raw
-                            else "escape_fts(:search_{})".format(i),
+                            match_clause=(
+                                ":search_{}".format(i)
+                                if search_mode_raw
+                                else "escape_fts(:search_{})".format(i)
+                            ),
                         )
                     )
                     human_descriptions.append(
@@ -280,6 +282,13 @@ class Filters:
                 format="%{}%",
             ),
             TemplatedFilter(
+                "notcontains",
+                "does not contain",
+                '"{c}" not like :{p}',
+                '{c} does not contain "{v}"',
+                format="%{}%",
+            ),
+            TemplatedFilter(
                 "endswith",
                 "ends with",
                 '"{c}" like :{p}',
@@ -359,12 +368,8 @@ class Filters:
     )
     _filters_by_key = {f.key: f for f in _filters}
 
-    def __init__(self, pairs, units=None, ureg=None):
-        if units is None:
-            units = {}
+    def __init__(self, pairs):
         self.pairs = pairs
-        self.units = units
-        self.ureg = ureg
 
     def lookups(self):
         """Yields (lookup, display, no_argument) pairs"""
@@ -404,20 +409,6 @@ class Filters:
     def has_selections(self):
         return bool(self.pairs)
 
-    def convert_unit(self, column, value):
-        """If the user has provided a unit in the query, convert it into the column unit, if present."""
-        if column not in self.units:
-            return value
-
-        # Try to interpret the value as a unit
-        value = self.ureg(value)
-        if isinstance(value, numbers.Number):
-            # It's just a bare number, assume it's the column unit
-            return value
-
-        column_unit = self.ureg(self.units[column])
-        return value.to(column_unit).magnitude
-
     def build_where_clauses(self, table):
         sql_bits = []
         params = {}
@@ -425,9 +416,7 @@ class Filters:
         for column, lookup, value in self.selections():
             filter = self._filters_by_key.get(lookup, None)
             if filter:
-                sql_bit, param = filter.where_clause(
-                    table, column, self.convert_unit(column, value), i
-                )
+                sql_bit, param = filter.where_clause(table, column, value, i)
                 sql_bits.append(sql_bit)
                 if param is not None:
                     if not isinstance(param, list):

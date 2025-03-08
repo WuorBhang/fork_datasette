@@ -1,3 +1,4 @@
+from asgi_csrf import Errors
 import asyncio
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import asgi_csrf
@@ -34,9 +35,9 @@ from jinja2 import (
 from jinja2.environment import Template
 from jinja2.exceptions import TemplateNotFound
 
+from .events import Event
 from .views import Context
-from .views.base import ureg
-from .views.database import database_download, DatabaseView, TableCreateView
+from .views.database import database_download, DatabaseView, TableCreateView, QueryView
 from .views.index import IndexView
 from .views.special import (
     JsonDataView,
@@ -66,20 +67,24 @@ from .utils import (
     StartupError,
     async_call_with_supported_arguments,
     await_me_maybe,
+    baseconv,
     call_with_supported_arguments,
+    detect_json1,
     display_actor,
     escape_css_string,
     escape_sqlite,
     find_spatialite,
     format_bytes,
     module_from_path,
+    move_plugins_and_allow,
+    move_table_config,
     parse_metadata,
     resolve_env_secrets,
     resolve_routes,
-    fail_if_plugins_in_metadata,
     tilde_decode,
     to_css_class,
     urlsafe_components,
+    redact_keys,
     row_sql_params_pks,
 )
 from .utils.asgi import (
@@ -110,6 +115,8 @@ app_root = Path(__file__).parent.parent
 
 # https://github.com/simonw/datasette/issues/283#issuecomment-781591015
 SQLITE_LIMIT_ATTACHED = 10
+
+INTERNAL_DB_NAME = "__INTERNAL__"
 
 Setting = collections.namedtuple("Setting", ("name", "default", "help"))
 SETTINGS = (
@@ -230,6 +237,13 @@ ResolvedRow = collections.namedtuple(
 )
 
 
+def _to_string(value):
+    if isinstance(value, str):
+        return value
+    else:
+        return json.dumps(value, default=str)
+
+
 class Datasette:
     # Message constants:
     INFO = 1
@@ -316,7 +330,7 @@ class Datasette:
             self._internal_database = Database(self, memory_name=secrets.token_hex())
         else:
             self._internal_database = Database(self, path=internal, mode="rwc")
-        self._internal_database.name = "__INTERNAL__"
+        self._internal_database.name = INTERNAL_DB_NAME
 
         self.cache_headers = cache_headers
         self.cors = cors
@@ -335,16 +349,20 @@ class Datasette:
             ]
         if config_dir and metadata_files and not metadata:
             with metadata_files[0].open() as fp:
-                metadata = fail_if_plugins_in_metadata(
-                    parse_metadata(fp.read()), metadata_files[0].name
-                )
+                metadata = parse_metadata(fp.read())
 
         if config_dir and config_files and not config:
             with config_files[0].open() as fp:
                 config = parse_metadata(fp.read())
 
-        self._metadata_local = fail_if_plugins_in_metadata(metadata or {})
+        # Move any "plugins" and "allow" settings from metadata to config - updates them in place
+        metadata = metadata or {}
+        config = config or {}
+        metadata, config = move_plugins_and_allow(metadata, config)
+        # Now migrate any known table configuration settings over as well
+        metadata, config = move_table_config(metadata, config)
 
+        self._metadata_local = metadata or {}
         self.sqlite_extensions = []
         for extension in sqlite_extensions or []:
             # Resolve spatialite, if requested
@@ -420,20 +438,64 @@ class Datasette:
                 ),
             ]
         )
-        self.jinja_env = Environment(
+        environment = Environment(
             loader=template_loader,
             autoescape=True,
             enable_async=True,
             # undefined=StrictUndefined,
         )
-        self.jinja_env.filters["escape_css_string"] = escape_css_string
-        self.jinja_env.filters["quote_plus"] = urllib.parse.quote_plus
-        self.jinja_env.filters["escape_sqlite"] = escape_sqlite
-        self.jinja_env.filters["to_css_class"] = to_css_class
+        environment.filters["escape_css_string"] = escape_css_string
+        environment.filters["quote_plus"] = urllib.parse.quote_plus
+        self._jinja_env = environment
+        environment.filters["escape_sqlite"] = escape_sqlite
+        environment.filters["to_css_class"] = to_css_class
         self._register_renderers()
         self._permission_checks = collections.deque(maxlen=200)
         self._root_token = secrets.token_hex(32)
         self.client = DatasetteClient(self)
+
+    async def apply_metadata_json(self):
+        # Apply any metadata entries from metadata.json to the internal tables
+        # step 1: top-level metadata
+        for key in self._metadata_local or {}:
+            if key == "databases":
+                continue
+            value = self._metadata_local[key]
+            await self.set_instance_metadata(key, _to_string(value))
+
+        # step 2: database-level metadata
+        for dbname, db in self._metadata_local.get("databases", {}).items():
+            for key, value in db.items():
+                if key in ("tables", "queries"):
+                    continue
+                await self.set_database_metadata(dbname, key, _to_string(value))
+
+            # step 3: table-level metadata
+            for tablename, table in db.get("tables", {}).items():
+                for key, value in table.items():
+                    if key == "columns":
+                        continue
+                    await self.set_resource_metadata(
+                        dbname, tablename, key, _to_string(value)
+                    )
+
+                # step 4: column-level metadata (only descriptions in metadata.json)
+                for columnname, column_description in table.get("columns", {}).items():
+                    await self.set_column_metadata(
+                        dbname, tablename, columnname, "description", column_description
+                    )
+
+            # TODO(alex) is metadata.json was loaded in, and --internal is not memory, then log
+            # a warning to user that they should delete their metadata.json file
+
+    def get_jinja_environment(self, request: Request = None) -> Environment:
+        environment = self._jinja_env
+        if request:
+            for environment in pm.hook.jinja2_environment_from_request(
+                datasette=self, request=request, env=environment
+            ):
+                pass
+        return environment
 
     def get_permission(self, name_or_abbr: str) -> "Permission":
         """
@@ -459,6 +521,7 @@ class Datasette:
         internal_db = self.get_internal_database()
         if not self.internal_db_created:
             await init_internal_db(internal_db)
+            await self.apply_metadata_json()
             self.internal_db_created = True
         current_schema_versions = {
             row["database_name"]: row["schema_version"]
@@ -495,6 +558,14 @@ class Datasette:
         # This must be called for Datasette to be in a usable state
         if self._startup_invoked:
             return
+        # Register event classes
+        event_classes = []
+        for hook in pm.hook.register_events(datasette=self):
+            extra_classes = await await_me_maybe(hook)
+            if extra_classes:
+                event_classes.extend(extra_classes)
+        self.event_classes = tuple(event_classes)
+
         # Register permissions, but watch out for duplicate name/abbr
         names = {}
         abbrs = {}
@@ -514,7 +585,7 @@ class Datasette:
                         abbrs[p.abbr] = p
                     self.permissions[p.name] = p
         for hook in pm.hook.prepare_jinja2_environment(
-            env=self.jinja_env, datasette=self
+            env=self._jinja_env, datasette=self
         ):
             await await_me_maybe(hook)
         for hook in pm.hook.startup(datasette=self):
@@ -599,6 +670,7 @@ class Datasette:
         return self.add_database(Database(self, memory_name=memory_name))
 
     def remove_database(self, name):
+        self.get_database(name).close()
         new_databases = self.databases.copy()
         new_databases.pop(name)
         self.databases = new_databases
@@ -621,57 +693,113 @@ class Datasette:
                 orig[key] = upd_value
         return orig
 
-    def metadata(self, key=None, database=None, table=None, fallback=True):
-        """
-        Looks up metadata, cascading backwards from specified level.
-        Returns None if metadata value is not found.
-        """
-        assert not (
-            database is None and table is not None
-        ), "Cannot call metadata() with table= specified but not database="
-        metadata = {}
+    async def get_instance_metadata(self):
+        rows = await self.get_internal_database().execute(
+            """
+              SELECT
+                key,
+                value
+              FROM metadata_instance
+            """
+        )
+        return dict(rows)
 
-        for hook_dbs in pm.hook.get_metadata(
-            datasette=self, key=key, database=database, table=table
-        ):
-            metadata = self._metadata_recursive_update(metadata, hook_dbs)
+    async def get_database_metadata(self, database_name: str):
+        rows = await self.get_internal_database().execute(
+            """
+              SELECT
+                key,
+                value
+              FROM metadata_databases
+              WHERE database_name = ?
+            """,
+            [database_name],
+        )
+        return dict(rows)
 
-        # security precaution!! don't allow anything in the local config
-        # to be overwritten. this is a temporary measure, not sure if this
-        # is a good idea long term or maybe if it should just be a concern
-        # of the plugin's implemtnation
-        metadata = self._metadata_recursive_update(metadata, self._metadata_local)
+    async def get_resource_metadata(self, database_name: str, resource_name: str):
+        rows = await self.get_internal_database().execute(
+            """
+              SELECT
+                key,
+                value
+              FROM metadata_resources
+              WHERE database_name = ?
+                AND resource_name = ?
+            """,
+            [database_name, resource_name],
+        )
+        return dict(rows)
 
-        databases = metadata.get("databases") or {}
+    async def get_column_metadata(
+        self, database_name: str, resource_name: str, column_name: str
+    ):
+        rows = await self.get_internal_database().execute(
+            """
+              SELECT
+                key,
+                value
+              FROM metadata_columns
+              WHERE database_name = ?
+                AND resource_name = ?
+                AND column_name = ?
+            """,
+            [database_name, resource_name, column_name],
+        )
+        return dict(rows)
 
-        search_list = []
-        if database is not None:
-            search_list.append(databases.get(database) or {})
-        if table is not None:
-            table_metadata = ((databases.get(database) or {}).get("tables") or {}).get(
-                table
-            ) or {}
-            search_list.insert(0, table_metadata)
+    async def set_instance_metadata(self, key: str, value: str):
+        # TODO upsert only supported on SQLite 3.24.0 (2018-06-04)
+        await self.get_internal_database().execute_write(
+            """
+              INSERT INTO metadata_instance(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """,
+            [key, value],
+        )
 
-        search_list.append(metadata)
-        if not fallback:
-            # No fallback allowed, so just use the first one in the list
-            search_list = search_list[:1]
-        if key is not None:
-            for item in search_list:
-                if key in item:
-                    return item[key]
-            return None
-        else:
-            # Return the merged list
-            m = {}
-            for item in search_list:
-                m.update(item)
-            return m
+    async def set_database_metadata(self, database_name: str, key: str, value: str):
+        # TODO upsert only supported on SQLite 3.24.0 (2018-06-04)
+        await self.get_internal_database().execute_write(
+            """
+              INSERT INTO metadata_databases(database_name, key, value)
+                VALUES(?, ?, ?)
+                ON CONFLICT(database_name, key) DO UPDATE SET value = excluded.value;
+            """,
+            [database_name, key, value],
+        )
 
-    @property
-    def _metadata(self):
-        return self.metadata()
+    async def set_resource_metadata(
+        self, database_name: str, resource_name: str, key: str, value: str
+    ):
+        # TODO upsert only supported on SQLite 3.24.0 (2018-06-04)
+        await self.get_internal_database().execute_write(
+            """
+              INSERT INTO metadata_resources(database_name, resource_name, key, value)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(database_name, resource_name, key) DO UPDATE SET value = excluded.value;
+            """,
+            [database_name, resource_name, key, value],
+        )
+
+    async def set_column_metadata(
+        self,
+        database_name: str,
+        resource_name: str,
+        column_name: str,
+        key: str,
+        value: str,
+    ):
+        # TODO upsert only supported on SQLite 3.24.0 (2018-06-04)
+        await self.get_internal_database().execute_write(
+            """
+              INSERT INTO metadata_columns(database_name, resource_name, column_name, key, value)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(database_name, resource_name, column_name, key) DO UPDATE SET value = excluded.value;
+            """,
+            [database_name, resource_name, column_name, key, value],
+        )
 
     def get_internal_database(self):
         return self._internal_database
@@ -749,24 +877,10 @@ class Datasette:
         if query:
             return query
 
-    def update_with_inherited_metadata(self, metadata):
-        # Fills in source/license with defaults, if available
-        metadata.update(
-            {
-                "source": metadata.get("source") or self.metadata("source"),
-                "source_url": metadata.get("source_url") or self.metadata("source_url"),
-                "license": metadata.get("license") or self.metadata("license"),
-                "license_url": metadata.get("license_url")
-                or self.metadata("license_url"),
-                "about": metadata.get("about") or self.metadata("about"),
-                "about_url": metadata.get("about_url") or self.metadata("about_url"),
-            }
-        )
-
     def _prepare_connection(self, conn, database):
         conn.row_factory = sqlite3.Row
         conn.text_factory = lambda x: str(x, "utf-8", "replace")
-        if self.sqlite_extensions:
+        if self.sqlite_extensions and database != INTERNAL_DB_NAME:
             conn.enable_load_extension(True)
             for extension in self.sqlite_extensions:
                 # "extension" is either a string path to the extension
@@ -779,7 +893,8 @@ class Datasette:
         if self.setting("cache_size_kb"):
             conn.execute(f"PRAGMA cache_size=-{self.setting('cache_size_kb')}")
         # pylint: disable=no-member
-        pm.hook.prepare_connection(conn=conn, database=database, datasette=self)
+        if database != INTERNAL_DB_NAME:
+            pm.hook.prepare_connection(conn=conn, database=database, datasette=self)
         # If self.crossdb and this is _memory, connect the first SQLITE_LIMIT_ATTACHED databases
         if self.crossdb and database == "_memory":
             count = 0
@@ -863,14 +978,23 @@ class Datasette:
         result = await await_me_maybe(result)
         return result
 
+    async def track_event(self, event: Event):
+        assert isinstance(event, self.event_classes), "Invalid event type: {}".format(
+            type(event)
+        )
+        for hook in pm.hook.track_event(datasette=self, event=event):
+            await await_me_maybe(hook)
+
     async def permission_allowed(
-        self, actor, action, resource=None, default=DEFAULT_NOT_SET
+        self, actor, action, resource=None, *, default=DEFAULT_NOT_SET
     ):
         """Check permissions using the permissions_allowed plugin hook"""
         result = None
         # Use default from registered permission, if available
         if default is DEFAULT_NOT_SET and action in self.permissions:
             default = self.permissions[action].default
+        opinions = []
+        # Every plugin is consulted for their opinion
         for check in pm.hook.permission_allowed(
             datasette=self,
             actor=actor,
@@ -879,14 +1003,24 @@ class Datasette:
         ):
             check = await await_me_maybe(check)
             if check is not None:
-                result = check
+                opinions.append(check)
+
+        result = None
+        # If any plugin said False it's false - the veto rule
+        if any(not r for r in opinions):
+            result = False
+        elif any(r for r in opinions):
+            # Otherwise, if any plugin said True it's true
+            result = True
+
         used_default = False
         if result is None:
+            # No plugin expressed an opinion, so use the default
             result = default
             used_default = True
         self._permission_checks.append(
             {
-                "when": datetime.datetime.utcnow().isoformat(),
+                "when": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "actor": actor,
                 "action": action,
                 "resource": resource,
@@ -1035,11 +1169,6 @@ class Datasette:
             url = "https://" + url[len("http://") :]
         return url
 
-    def _register_custom_units(self):
-        """Register any custom units defined in the metadata.json with Pint"""
-        for unit in self.metadata("custom_units") or []:
-            ureg.define(unit)
-
     def _connected_databases(self):
         return [
             {
@@ -1058,9 +1187,8 @@ class Datasette:
         conn = sqlite3.connect(":memory:")
         self._prepare_connection(conn, "_memory")
         sqlite_version = conn.execute("select sqlite_version()").fetchone()[0]
-        sqlite_extensions = {}
+        sqlite_extensions = {"json1": detect_json1(conn)}
         for extension, testsql, hasversion in (
-            ("json1", "SELECT json('{}')", False),
             ("spatialite", "SELECT spatialite_version()", True),
         ):
             try:
@@ -1173,10 +1301,11 @@ class Datasette:
     def _actor(self, request):
         return {"actor": request.actor}
 
-    def table_metadata(self, database, table):
-        """Fetch table-specific metadata."""
+    async def table_config(self, database: str, table: str) -> dict:
+        """Return dictionary of configuration for specified table"""
         return (
-            (self.metadata("databases") or {})
+            (self.config or {})
+            .get("databases", {})
             .get(database, {})
             .get("tables", {})
             .get(table, {})
@@ -1218,7 +1347,7 @@ class Datasette:
         else:
             if isinstance(templates, str):
                 templates = [templates]
-            template = self.jinja_env.select_template(templates)
+            template = self.get_jinja_environment(request).select_template(templates)
         if dataclasses.is_dataclass(context):
             context = dataclasses.asdict(context)
         body_scripts = []
@@ -1306,6 +1435,18 @@ class Datasette:
 
         return await template.render_async(template_context)
 
+    def set_actor_cookie(
+        self, response: Response, actor: dict, expire_after: Optional[int] = None
+    ):
+        data = {"a": actor}
+        if expire_after:
+            expires_at = int(time.time()) + (24 * 60 * 60)
+            data["e"] = baseconv.base62.encode(expires_at)
+        response.set_cookie("ds_actor", self.sign(data, "actor"))
+
+    def delete_actor_cookie(self, response: Response):
+        response.set_cookie("ds_actor", "", expires=0, max_age=0)
+
     async def _asset_urls(self, key, template, context, request, view_name):
         # Flatten list-of-lists from plugins:
         seen_urls = set()
@@ -1346,6 +1487,11 @@ class Datasette:
             output.append(script)
         return output
 
+    def _config(self):
+        return redact_keys(
+            self.config, ("secret", "key", "password", "token", "hash", "dsn")
+        )
+
     def _routes(self):
         routes = []
 
@@ -1357,6 +1503,8 @@ class Datasette:
             routes.append((regex, view))
 
         add_route(IndexView.as_view(self), r"/(\.(?P<format>jsono?))?$")
+        add_route(IndexView.as_view(self), r"/-/(\.(?P<format>jsono?))?$")
+        add_route(permanent_redirect("/-/"), r"/-$")
         # TODO: /favicon.ico and /-/static/ deserve far-future cache expires
         add_route(favicon, "/favicon.ico")
 
@@ -1387,10 +1535,6 @@ class Datasette:
             r"/:memory:(?P<rest>.*)$",
         )
         add_route(
-            JsonDataView.as_view(self, "metadata.json", lambda: self.metadata()),
-            r"/-/metadata(\.(?P<format>json))?$",
-        )
-        add_route(
             JsonDataView.as_view(self, "versions.json", self._versions),
             r"/-/versions(\.(?P<format>json))?$",
         )
@@ -1405,12 +1549,8 @@ class Datasette:
             r"/-/settings(\.(?P<format>json))?$",
         )
         add_route(
-            permanent_redirect("/-/settings.json"),
-            r"/-/config.json",
-        )
-        add_route(
-            permanent_redirect("/-/settings"),
-            r"/-/config",
+            JsonDataView.as_view(self, "config.json", lambda: self._config()),
+            r"/-/config(\.(?P<format>json))?$",
         )
         add_route(
             JsonDataView.as_view(self, "threads.json", self._threads),
@@ -1468,6 +1608,10 @@ class Datasette:
         )
         add_route(TableCreateView.as_view(self), r"/(?P<database>[^\/\.]+)/-/create$")
         add_route(
+            wrap_view(QueryView, self),
+            r"/(?P<database>[^\/\.]+)/-/query(\.(?P<format>\w+))?$",
+        )
+        add_route(
             wrap_view(table_view, self),
             r"/(?P<database>[^\/\.]+)/(?P<table>[^\/\.]+)(\.(?P<format>\w+))?$",
         )
@@ -1506,9 +1650,7 @@ class Datasette:
         try:
             return self.get_database(route=database_route)
         except KeyError:
-            raise DatabaseNotFound(
-                "Database not found: {}".format(database_route), database_route
-            )
+            raise DatabaseNotFound(database_route)
 
     async def resolve_table(self, request):
         db = await self.resolve_database(request)
@@ -1519,9 +1661,7 @@ class Datasette:
         if not table_exists:
             is_view = await db.view_exists(table_name)
         if not (table_exists or is_view):
-            raise TableNotFound(
-                "Table not found: {}".format(table_name), db.name, table_name
-            )
+            raise TableNotFound(db.name, table_name)
         return ResolvedTable(db, table_name, is_view)
 
     async def resolve_row(self, request):
@@ -1531,21 +1671,29 @@ class Datasette:
         results = await db.execute(sql, params, truncate=True)
         row = results.first()
         if row is None:
-            raise RowNotFound(
-                "Row not found: {}".format(pk_values), db.name, table_name, pk_values
-            )
+            raise RowNotFound(db.name, table_name, pk_values)
         return ResolvedRow(db, table_name, sql, params, pks, pk_values, results.first())
 
     def app(self):
         """Returns an ASGI app function that serves the whole of Datasette"""
         routes = self._routes()
-        self._register_custom_units()
 
         async def setup_db():
             # First time server starts up, calculate table counts for immutable databases
             for database in self.databases.values():
                 if not database.is_mutable:
                     await database.table_counts(limit=60 * 60 * 1000)
+
+        async def custom_csrf_error(scope, send, message_id):
+            await asgi_send(
+                send,
+                content=await self.render_template(
+                    "csrf_error.html",
+                    {"message_id": message_id, "message_name": Errors(message_id).name},
+                ),
+                status=403,
+                content_type="text/html; charset=utf-8",
+            )
 
         asgi = asgi_csrf.asgi_csrf(
             DatasetteRouter(self, routes),
@@ -1554,6 +1702,7 @@ class Datasette:
             skip_if_scope=lambda scope: any(
                 pm.hook.skip_csrf(datasette=self, scope=scope)
             ),
+            send_csrf_failed=custom_csrf_error,
         )
         if self.setting("trace_debug"):
             asgi = AsgiTracer(asgi)
@@ -1568,16 +1717,6 @@ class DatasetteRouter:
     def __init__(self, datasette, routes):
         self.ds = datasette
         self.routes = routes or []
-        # Build a list of pages/blah/{name}.html matching expressions
-        pattern_templates = [
-            filepath
-            for filepath in self.ds.jinja_env.list_templates()
-            if "{" in filepath and filepath.startswith("pages/")
-        ]
-        self.page_routes = [
-            (route_pattern_from_filepath(filepath[len("pages/") :]), filepath)
-            for filepath in pattern_templates
-        ]
 
     async def __call__(self, scope, receive, send):
         # Because we care about "foo/bar" v.s. "foo%2Fbar" we decode raw_path ourselves
@@ -1677,13 +1816,24 @@ class DatasetteRouter:
             route_path = request.scope.get("route_path", request.scope["path"])
             # Jinja requires template names to use "/" even on Windows
             template_name = "pages" + route_path + ".html"
+            # Build a list of pages/blah/{name}.html matching expressions
+            environment = self.ds.get_jinja_environment(request)
+            pattern_templates = [
+                filepath
+                for filepath in environment.list_templates()
+                if "{" in filepath and filepath.startswith("pages/")
+            ]
+            page_routes = [
+                (route_pattern_from_filepath(filepath[len("pages/") :]), filepath)
+                for filepath in pattern_templates
+            ]
             try:
-                template = self.ds.jinja_env.select_template([template_name])
+                template = environment.select_template([template_name])
             except TemplateNotFound:
                 template = None
             if template is None:
                 # Try for a pages/blah/{name}.html template match
-                for regex, wildcard_template in self.page_routes:
+                for regex, wildcard_template in page_routes:
                     match = regex.match(route_path)
                     if match is not None:
                         context.update(match.groupdict())
@@ -1886,37 +2036,40 @@ class DatasetteClient:
             path = f"http://localhost{path}"
         return path
 
+    async def _request(self, method, path, **kwargs):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            cookies=kwargs.pop("cookies", None),
+        ) as client:
+            return await getattr(client, method)(self._fix(path), **kwargs)
+
     async def get(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.get(self._fix(path), **kwargs)
+        return await self._request("get", path, **kwargs)
 
     async def options(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.options(self._fix(path), **kwargs)
+        return await self._request("options", path, **kwargs)
 
     async def head(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.head(self._fix(path), **kwargs)
+        return await self._request("head", path, **kwargs)
 
     async def post(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.post(self._fix(path), **kwargs)
+        return await self._request("post", path, **kwargs)
 
     async def put(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.put(self._fix(path), **kwargs)
+        return await self._request("put", path, **kwargs)
 
     async def patch(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.patch(self._fix(path), **kwargs)
+        return await self._request("patch", path, **kwargs)
 
     async def delete(self, path, **kwargs):
-        async with httpx.AsyncClient(app=self.app) as client:
-            return await client.delete(self._fix(path), **kwargs)
+        return await self._request("delete", path, **kwargs)
 
     async def request(self, method, path, **kwargs):
         avoid_path_rewrites = kwargs.pop("avoid_path_rewrites", None)
-        async with httpx.AsyncClient(app=self.app) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            cookies=kwargs.pop("cookies", None),
+        ) as client:
             return await client.request(
                 method, self._fix(path, avoid_path_rewrites), **kwargs
             )

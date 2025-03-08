@@ -42,18 +42,22 @@ EXPECTED_PLUGINS = [
             "extra_js_urls",
             "extra_template_vars",
             "forbidden",
+            "homepage_actions",
             "menu_links",
             "permission_allowed",
             "prepare_connection",
             "prepare_jinja2_environment",
+            "query_actions",
             "register_facet_classes",
             "register_magic_parameters",
             "register_permissions",
             "register_routes",
             "render_cell",
+            "row_actions",
             "skip_csrf",
             "startup",
             "table_actions",
+            "view_actions",
         ],
     },
     {
@@ -375,7 +379,6 @@ METADATA = {
                     ],
                 },
                 "no_primary_key": {"sortable_columns": [], "hidden": True},
-                "units": {"units": {"distance": "m", "frequency": "Hz"}},
                 "primary_key_multiple_columns_explicit_label": {
                     "label_column": "content2"
                 },
@@ -401,7 +404,7 @@ METADATA = {
 TABLES = (
     """
 CREATE TABLE simple_primary_key (
-  id varchar(30) primary key,
+  id integer primary key,
   content text
 );
 
@@ -438,8 +441,8 @@ CREATE INDEX idx_compound_three_primary_keys_content ON compound_three_primary_k
 
 CREATE TABLE foreign_key_references (
   pk varchar(30) primary key,
-  foreign_key_with_label varchar(30),
-  foreign_key_with_blank_label varchar(30),
+  foreign_key_with_label integer,
+  foreign_key_with_blank_label integer,
   foreign_key_with_no_label varchar(30),
   foreign_key_compound_pk1 varchar(30),
   foreign_key_compound_pk2 varchar(30),
@@ -489,9 +492,9 @@ CREATE TABLE "table/with/slashes.csv" (
 
 CREATE TABLE "complex_foreign_keys" (
   pk varchar(30) primary key,
-  f1 text,
-  f2 text,
-  f3 text,
+  f1 integer,
+  f2 integer,
+  f3 integer,
   FOREIGN KEY ("f1") REFERENCES [simple_primary_key](id),
   FOREIGN KEY ("f2") REFERENCES [simple_primary_key](id),
   FOREIGN KEY ("f3") REFERENCES [simple_primary_key](id)
@@ -502,16 +505,6 @@ CREATE TABLE "custom_foreign_key_label" (
   foreign_key_with_custom_label text,
   FOREIGN KEY ("foreign_key_with_custom_label") REFERENCES [primary_key_multiple_columns_explicit_label](id)
 );
-
-CREATE TABLE units (
-  pk integer primary key,
-  distance int,
-  frequency int
-);
-
-INSERT INTO units VALUES (1, 1, 100);
-INSERT INTO units VALUES (2, 5000, 2500);
-INSERT INTO units VALUES (3, 100000, 75000);
 
 CREATE TABLE tags (
     tag TEXT PRIMARY KEY

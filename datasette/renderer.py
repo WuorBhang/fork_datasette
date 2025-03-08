@@ -56,7 +56,6 @@ def json_renderer(request, args, data, error, truncated=None):
 
     if truncated is not None:
         data["truncated"] = truncated
-
     if shape == "arrayfirst":
         if not data["rows"]:
             data = []
@@ -68,7 +67,7 @@ def json_renderer(request, args, data, error, truncated=None):
     elif shape in ("objects", "object", "array"):
         columns = data.get("columns")
         rows = data.get("rows")
-        if rows and columns:
+        if rows and columns and not isinstance(rows[0], dict):
             data["rows"] = [dict(zip(columns, row)) for row in rows]
         if shape == "object":
             shape_error = None
